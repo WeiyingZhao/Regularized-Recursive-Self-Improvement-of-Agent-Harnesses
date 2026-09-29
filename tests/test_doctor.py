@@ -212,6 +212,43 @@ def test_evolve_ids_failure_is_reported_not_raised(tmp_path):
     assert c.status == "fail" and "no eligible tasks under /y" in c.detail
 
 
+# ---- adapter output must not reach stdout (`--json` must stay parseable) -----------------
+def _cli_module():
+    spec = importlib.util.spec_from_file_location("rrsi_cli", ROOT / "rrsi.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class ChattyDomain(FakeDomain):
+    def evolve_ids(self):
+        print('{"meta": "printed while loading evolve tasks"}')
+        return ["t1"]
+
+    def doctor_checks(self):
+        print("printed by a domain check")
+        return [CheckResult("chatty", "ok", "fine")]
+
+
+def test_adapter_output_is_kept_off_stdout(tmp_path, capsys):
+    res = _run(tmp_path, domain=ChattyDomain())
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "printed while loading evolve tasks" in cap.err and "printed by a domain check" in cap.err
+    c = _by_name(res)
+    assert c["evolve tasks"].status == "ok" and c["chatty"].status == "ok"
+
+
+def test_doctor_json_stays_parseable_when_the_adapter_prints(tmp_path, capsys):
+    cli = _cli_module()
+    rc = cli.cmd_doctor(ChattyDomain(), RRSIConfig(), tmp_path / "runs", as_json=True)
+    cap = capsys.readouterr()
+    payload = json.loads(cap.out)                      # nothing but the payload on stdout
+    assert payload["domain"] == "fake" and rc == (0 if payload["ok"] else 1)
+    assert "printed while loading" in cap.err
+    assert not (tmp_path / "runs").exists()
+
+
 # ---- domain hook ------------------------------------------------------------------------
 def test_base_domain_hook_is_empty():
     assert Domain().doctor_checks() == []

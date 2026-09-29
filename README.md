@@ -129,7 +129,7 @@ python3 rrsi.py --domain <name> doctor [--json]   # prerequisites; exits 1 if an
 python3 rrsi.py --domain <name> plan [--json]     # upper-bound trial and search-call counts
 ```
 
-`doctor` checks Python, the `anthropic` package (found, not imported), that `RRSI_VERTEX_PROJECTS` is set (only the project count is shown), git, the configuration, the runs directory, the domain's files and task set, and the instance's own tools (Docker, the benchmark checkout, `bwrap`). `plan` prints baseline, candidate and smoke trial counts and search-role calls for the configured `T`, `k` and `m`, for example 178 baseline and up to 7,120 candidate trials for `coding`. They are upper bounds, not spend or latency, and exclude judge calls, retries and infrastructure reruns. Note that `round --dry-run` is not free: it still makes paid analyst calls.
+`doctor` checks Python, the `anthropic` package (found, not imported), that `RRSI_VERTEX_PROJECTS` is set (only the project count is shown), git, the configuration, the runs directory, the domain's files and task set, and the instance's own tools (Docker, the benchmark checkout, `bwrap`). `plan` prints baseline, candidate and smoke trial counts and search-role invocations (analyst, proposer, critic) for the configured `T`, `k` and `m`, for example 178 baseline and up to 7,120 candidate trials for `coding`. They are upper bounds, not spend or latency, and exclude judge calls, retries and infrastructure reruns. Search-role figures count invocations, not model calls or tokens: the analyst and its digester subagents run several model turns per invocation, and a proposer or critic invocation may make more than one model call. Note that `round --dry-run` is not free: it still makes paid analyst calls.
 
 ## 📊 Results
 

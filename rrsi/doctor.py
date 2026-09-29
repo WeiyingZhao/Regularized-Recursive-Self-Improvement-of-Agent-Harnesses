@@ -20,6 +20,7 @@ count), never by value. A domain adds its own checks through Domain.doctor_check
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import shutil
@@ -137,7 +138,8 @@ def _harness(domain, repo: Path) -> CheckResult:
 
 def _evolve_tasks(domain) -> CheckResult:
     try:
-        n = len(domain.evolve_ids())
+        with contextlib.redirect_stdout(sys.stderr):        # adapters may print while loading
+            n = len(domain.evolve_ids())
     except (Exception, SystemExit) as e:  # noqa: BLE001
         return _fail("evolve tasks", failure_reason(e),
                      f"see domains/{domain.name}/README.md for the benchmark checkout")
@@ -146,13 +148,15 @@ def _evolve_tasks(domain) -> CheckResult:
 
 def doctor(domain, cfg_or_error, repo: Path, runs_dir: Path, environ=os.environ) -> list[CheckResult]:
     """Core checks, then the domain's own. `cfg_or_error` is the loaded RRSIConfig or the
-    ConfigError the CLI caught; nothing here writes to disk or calls a model."""
+    ConfigError the CLI caught; nothing here calls a model. Whatever a domain prints while
+    loading its task set goes to stderr, keeping stdout clean for `--json`."""
     repo, runs_dir = Path(repo), Path(runs_dir)
     out = [_python(), _anthropic(), _vertex_projects(environ), _git(repo, environ),
            _config(cfg_or_error, domain), _runs_dir(runs_dir, domain),
            _constitution(domain, repo), _harness(domain, repo), _evolve_tasks(domain)]
     try:
-        out += list(domain.doctor_checks())
+        with contextlib.redirect_stdout(sys.stderr):
+            out += list(domain.doctor_checks())
     except (Exception, SystemExit) as e:  # noqa: BLE001
         out.append(_fail("domain checks", failure_reason(e)))
     return out

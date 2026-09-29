@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -56,7 +57,7 @@ def test_unknown_task_counts_are_none_never_zero():
     assert est.baseline_trials is None
     assert est.candidate_trials_max is None
     assert est.smoke_trials_max is None
-    assert est.search_calls_per_round > 0           # independent of the task set
+    assert est.search_invocations_per_round > 0           # independent of the task set
     out = render_workload(est)
     assert out.count("unknown") >= 5 and "no checkout" in out
     assert json.loads(json.dumps(asdict(est)))["candidate_trials_max"] is None
@@ -71,13 +72,13 @@ def test_smoke_trials_use_one_trial_per_task():
 def test_search_call_bound_computed_by_hand():
     # T=3, m=2, repair_rounds=1: per round 1 analyst + 2*(1+1) proposer + 2*(1+1) critic = 9
     est = estimate_workload(RRSIConfig(T=3, k=1, m=2, repair_rounds=1), 10, 2)
-    assert est.analyst_calls_per_round == 1
-    assert est.proposer_calls_per_round == 4 and est.critic_calls_per_round == 4
-    assert est.search_calls_per_round == 9
-    assert est.search_calls_total == 27
+    assert est.analyst_invocations_per_round == 1
+    assert est.proposer_invocations_per_round == 4 and est.critic_invocations_per_round == 4
+    assert est.search_invocations_per_round == 9
+    assert est.search_invocations_total == 27
     # no repair attempts: 1 + 1 + 1 for m=1
     est = estimate_workload(RRSIConfig(T=5, m=1, repair_rounds=0, m_draft=0), 10, 2)
-    assert est.search_calls_per_round == 3 and est.search_calls_total == 15
+    assert est.search_invocations_per_round == 3 and est.search_invocations_total == 15
 
 
 def test_render_states_bounds_and_exclusions():
@@ -85,6 +86,21 @@ def test_render_states_bounds_and_exclusions():
     assert "upper-bound" in out and "not spend or latency" in out
     for excluded in ("judge calls", "retries", "infrastructure reruns"):
         assert excluded in out
+
+
+def test_search_role_figures_are_invocations_not_model_calls():
+    est = estimate_workload(_shipped("coding"), 89, 2)
+    out = render_workload(est)
+    assert "search-role invocations per round, max" in out
+    assert "search-role invocations over T rounds, max" in out
+    assert "search-role calls" not in out
+    assert "invocations, not model calls or tokens" in out
+    assert "digester" in out and "more than one model call" in out
+    fields = asdict(est)
+    assert {"analyst_invocations_per_round", "proposer_invocations_per_round",
+            "critic_invocations_per_round", "search_invocations_per_round",
+            "search_invocations_total"} <= set(fields)
+    assert not [f for f in fields if "calls" in f]
 
 
 class _Domain:
@@ -117,6 +133,42 @@ def test_task_counts_reports_failures_instead_of_raising():
 def test_failure_reason_is_one_line():
     assert failure_reason(SystemExit("a\nb  c")) == "a b c"
     assert failure_reason(FileNotFoundError("gone")) == "FileNotFoundError: gone"
+
+
+class _Chatty:
+    """Adapters may print while loading a task set (workspace split() does on first use)."""
+    name = "chatty"
+
+    def evolve_ids(self):
+        print('{"meta": "printed while loading evolve tasks"}')
+        return ["a", "b"]
+
+    def smoke_ids(self):
+        print("printed while loading smoke tasks")
+        return ["a"]
+
+
+def _cli_module():
+    spec = importlib.util.spec_from_file_location("rrsi_cli", ROOT / "rrsi.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_adapter_output_does_not_pollute_stdout(capsys):
+    assert task_counts(_Chatty()) == (2, 1, {})
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "printed while loading evolve tasks" in cap.err
+    assert "printed while loading smoke tasks" in cap.err
+
+
+def test_plan_json_stays_parseable_when_the_adapter_prints(capsys):
+    _cli_module().cmd_plan(_Chatty(), RRSIConfig(T=2, k=3, m=1), as_json=True)
+    cap = capsys.readouterr()
+    d = json.loads(cap.out)                            # nothing but the payload on stdout
+    assert (d["n_tasks"], d["n_smoke"], d["baseline_trials"]) == (2, 1, 6)
+    assert "printed while loading" in cap.err
 
 
 def _cli(*args, runs: Path):
