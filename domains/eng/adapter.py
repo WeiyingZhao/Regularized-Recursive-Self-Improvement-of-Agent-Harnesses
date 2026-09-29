@@ -49,13 +49,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent.parent))
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent.parent))  # the repo root only: siblings are `domains.<name>.*`
 from rrsi.doctor import CheckResult    # noqa: E402
 from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
-import briefs                            # noqa: E402
-import render                            # noqa: E402
+from domains.eng import briefs, render  # noqa: E402
 
 CFG = json.loads((HERE / "rrsi.json").read_text())
 SPLIT = json.loads((HERE / "data" / "split_engd.json").read_text())

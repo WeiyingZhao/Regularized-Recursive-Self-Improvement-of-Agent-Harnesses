@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rrsi.config import ConfigError, RRSIConfig
+from rrsi.domain import validate_domain
 from rrsi.planning import failure_reason
 
 MIN_PYTHON = (3, 10)
@@ -136,6 +137,18 @@ def _harness(domain, repo: Path) -> CheckResult:
     return _fail("harness", f"{h} is missing", "restore the harness directory from the repository")
 
 
+def _domain_contract(domain) -> CheckResult:
+    """The adapter implements the Domain interface; no task set is loaded."""
+    try:
+        problems = validate_domain(domain)
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        return _fail("domain contract", failure_reason(e))
+    if problems:
+        return _fail("domain contract", "; ".join(problems),
+                     f"complete domains/{domain.name}/adapter.py against rrsi.domain.Domain")
+    return _ok("domain contract", "required methods, briefs and constitution files present")
+
+
 def _evolve_tasks(domain) -> CheckResult:
     try:
         with contextlib.redirect_stdout(sys.stderr):        # adapters may print while loading
@@ -153,7 +166,8 @@ def doctor(domain, cfg_or_error, repo: Path, runs_dir: Path, environ=os.environ)
     repo, runs_dir = Path(repo), Path(runs_dir)
     out = [_python(), _anthropic(), _vertex_projects(environ), _git(repo, environ),
            _config(cfg_or_error, domain), _runs_dir(runs_dir, domain),
-           _constitution(domain, repo), _harness(domain, repo), _evolve_tasks(domain)]
+           _constitution(domain, repo), _harness(domain, repo), _domain_contract(domain),
+           _evolve_tasks(domain)]
     try:
         with contextlib.redirect_stdout(sys.stderr):
             out += list(domain.doctor_checks())
