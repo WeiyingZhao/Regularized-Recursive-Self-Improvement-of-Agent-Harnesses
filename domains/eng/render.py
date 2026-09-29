@@ -231,11 +231,7 @@ def load_trial(job_dir, task: dict, trial: int) -> dict | None:
     rec["payload"] = pp.read_text(errors="replace") if pp.is_file() else ""
     rec["traj"] = json.loads(tp.read_text()) if tp.is_file() else {}
     try:
-        import sys as _sys
-        from pathlib import Path as _P
-        _sys.path.insert(0, str(_P(__file__).resolve().parent / "bench"))
-        _sys.path.insert(0, str(_P(__file__).resolve().parent))
-        import diagnostics as _D
+        from domains.eng.bench import diagnostics as _D   # its own `import config` is the eng one
         rec["diag"] = _D.trial_stats(rec["traj"], rec["meta"])
     except Exception:  # noqa: BLE001 - evidence rendering must never kill a round
         rec["diag"] = {}

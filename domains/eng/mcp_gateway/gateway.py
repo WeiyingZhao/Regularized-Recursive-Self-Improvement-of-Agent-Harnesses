@@ -65,7 +65,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
-GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8994"))
+GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8996"))
 CODE_EXEC_PYTHON = os.environ.get("CODE_EXEC_PYTHON", "/opt/conda/bin/python3")
 CODE_EXEC_TIMEOUT = int(os.environ.get("CODE_EXEC_TIMEOUT", "600"))
 WORKSPACE_BASE = os.path.realpath(

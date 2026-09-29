@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 
 from .components import K
+from .state import atomic_write_text
 
 MEASURED_OUTCOMES = ("ACCEPTED", "REJECTED", "LOST")
 
@@ -74,36 +75,52 @@ class History:
         with open(self.path, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    def append_candidate(self, t: int, variant: str, edits: list[dict],
-                         outcome: str, delta_S: float | None,
-                         delta_C: float | None, accepted: bool,
-                         S: float | None, C: float | None,
-                         diff: str | None, detail: str = "") -> None:
+    def append_candidate(self, *args, **kw) -> None:
         """Write the per-edit records of one candidate harness H'."""
-        for e in edits or [{"id": "C1", "component": None, "hypothesis": None}]:
-            self.append({
-                "t": t, "variant": variant, "edit_id": e.get("id"),
-                "component": e.get("component"),
-                "hypothesis": e.get("hypothesis") or e.get("mechanism"),
-                "targets_mode": e.get("targets_mode"),
-                "predicted_affected": e.get("predicted_affected"),
-                "diff": diff,
-                "delta_S": None if delta_S is None else round(delta_S, 6),
-                "delta_C": None if delta_C is None else round(delta_C, 6),
-                "accepted": bool(accepted),
-                "outcome": outcome,
-                "S": None if S is None else round(S, 6),
-                "C": None if C is None else round(C, 1),
-                "bundle": len(edits or []),
-                "detail": detail[:600] if detail else "",
-            })
+        for rec in self.candidate_rows(*args, **kw):
+            self.append(rec)
+
+    @staticmethod
+    def candidate_rows(t: int, variant: str, edits: list[dict],
+                       outcome: str, delta_S: float | None,
+                       delta_C: float | None, accepted: bool,
+                       S: float | None, C: float | None,
+                       diff: str | None, detail: str = "") -> list[dict]:
+        """The per-edit records of one candidate harness H' (timestamped now)."""
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        return [{
+            "t": t, "variant": variant, "edit_id": e.get("id"),
+            "component": e.get("component"),
+            "hypothesis": e.get("hypothesis") or e.get("mechanism"),
+            "targets_mode": e.get("targets_mode"),
+            "predicted_affected": e.get("predicted_affected"),
+            "diff": diff,
+            "delta_S": None if delta_S is None else round(delta_S, 6),
+            "delta_C": None if delta_C is None else round(delta_C, 6),
+            "accepted": bool(accepted),
+            "outcome": outcome,
+            "S": None if S is None else round(S, 6),
+            "C": None if C is None else round(C, 1),
+            "bundle": len(edits or []),
+            "detail": detail[:600] if detail else "",
+            "ts": ts,
+        } for e in edits or [{"id": "C1", "component": None, "hypothesis": None}]]
 
     def replace_round(self, t: int, keep=lambda r: False) -> None:
         """Drop the per-edit records of round t (a re-adjudication rewrites
-        them); records satisfying `keep` survive."""
+        them); records satisfying `keep` survive. The file is replaced atomically."""
         recs = [r for r in self.records()
                 if not (r.get("t") == t and r.get("edit_id")) or keep(r)]
-        self.path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs))
+        atomic_write_text(self.path, "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                            for r in recs))
+
+    def rewrite_round(self, t: int, rows: list[dict]) -> None:
+        """Replace the candidate records of round t (all but the baseline's `-`) by
+        `rows` in one atomic write. Idempotent: the same rows again give the same file."""
+        recs = [r for r in self.records() if not (
+            r.get("t") == t and (r.get("edit_id") or r.get("variant", "-") != "-"))]
+        atomic_write_text(self.path, "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                             for r in recs + list(rows)))
 
     def has(self, t: int, variant: str) -> bool:
         return any(r.get("t") == t and r.get("variant") == variant

@@ -38,11 +38,20 @@ side), for round t = 0..T-1 of one domain.
              Critic(H_t, C_t^(v)) with bounded repair          critic.review
              liveness smoke (compile / construct / few tasks)   domain.smoke
       5. Evaluate(H', D_evolve, k) for the screened set        evaluate.evaluate (parallel optional)
-      6. admissibility, argmax, S*, history records, B_t       select.select_round
-      7. fast-forward evolve/<domain> to the winner, update frontier
+      6. admissibility, argmax, S*; decisions, history and     select.select_round
+         attribution rows, in memory only
+      7. settle H_{t+1}: settlement.json (pending, carrying the rows of 6) ->
+         decisions.json, round-t history and attribution -> compare-and-swap
+         evolve/<domain> to the winner -> frontier -> settlement.json (done)
 
 Everything written under runs/<domain>/ is resume-safe: a round that crashed
-after evaluating variant A reuses A's eval.json when re-run.
+after evaluating variant A reuses A's eval.json when re-run, nothing of round t
+reaches history before its settlement record, and a settlement interrupted
+anywhere after that record is finished by `recover()` before round / baseline /
+readjudicate / reevaluate do anything else. A settled round is never re-run; a
+round whose every screened candidate failed evaluation for infrastructure
+reasons is not settled at all. Only the most recently settled round can be
+revised (readjudicate / reevaluate), and only before the next one has started.
 """
 
 from __future__ import annotations
@@ -57,19 +66,30 @@ from . import gitops as G
 from .analyst import analyze, load_digests
 from .calibrate import calibrate as _calibrate, write as _write_cal
 from .components import normalize
-from .config import RRSIConfig
+from .config import VARIANT_LABELS, RRSIConfig
 from .critic import review
 from .evaluate import EvalResult, evaluate
 from .history import History, exploration, stall_flag
 from .propose import propose
+from .provenance import (ProvenanceError, fingerprint, manifest_path, mismatches, move_aside,
+                         read_manifest)
 from .schedule import edit_budget
 from .selection import Candidate, select_round
-
-VARIANT_LABELS = "ABCDEFGH"
+from .state import atomic_write_json, atomic_write_text
 
 
 def log(domain: str, msg: str) -> None:
     print(f"[rrsi:{domain}] {time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def _fmt_dc(delta_C: float | None) -> str:
+    """Delta C for a log line; unknown cost prints n/a, never a number."""
+    return "n/a" if delta_C is None else f"{delta_C:+.3f}"
+
+
+def _fmt_cov(coverage: float | None) -> str:
+    """Token coverage of C' for a log line; n/a when not recorded (older eval.json)."""
+    return "n/a" if coverage is None else f"{coverage:.2f}"
 
 
 class Run:
@@ -84,6 +104,7 @@ class Run:
         self.calibration_path = self.runs / "calibration.json"
         self.global_analysis = self.runs / "global_analysis.json"
         self.attribution_path = self.runs / "attribution.jsonl"
+        self.settlement_path = self.runs / "settlement.json"
         self.history = History(self.runs / "history.jsonl")
         self.branch = f"evolve/{domain.name}"
         self.harness_rel = os.path.normpath(f"domains/{domain.name}/{domain.harness_path}")
@@ -97,7 +118,7 @@ class Run:
         return json.loads(self.frontier_path.read_text())
 
     def save_frontier(self, fr: dict) -> None:
-        self.frontier_path.write_text(json.dumps(fr, indent=1))
+        atomic_write_json(self.frontier_path, fr)
 
     def delta(self) -> float:
         if self.cfg.delta is not None:
@@ -130,13 +151,96 @@ class Run:
     def harness_tree(self, ref: str) -> str:
         return G.tree_hash(self.repo, ref, self.harness_rel)
 
+    def fingerprint(self, ref: str, ids: list[str], k: int | None = None) -> dict:
+        """Evaluation identity (commit, harness tree, k, task set) of `ref`."""
+        return fingerprint(self.repo, ref, self.harness_rel, ids, k or self.cfg.k)
+
+    # ------------------------------------------------------- settlement --
+    def _settle(self, t: int, kind: str, new_commit: str, fr_new: dict,
+                old: str | None = None, decisions: list | None = None,
+                history: list | None = None, attribution: list | None = None) -> None:
+        """Move evolve/<domain> to H_{t+1} as one recoverable step. Everything is
+        resolved and checked before the first write, including that the branch is
+        still at `old`, the tip the caller planned from (default: the current tip);
+        then settlement.json is written `pending` and applied (_apply). The record
+        carries the round's decisions and complete round-t history rows (both kinds)
+        and, for a round, its attribution rows; _apply writes them."""
+        what = f"round {t} not {'settled' if kind == 'round' else 're-adjudicated'}"
+        old = old or G.full_rev(self.repo, self.branch)
+        new = G.full_rev(self.repo, new_commit)
+        if not old or not new:
+            raise SystemExit(f"{what}: cannot resolve {self.branch} "
+                             f"({old or '?'}) or {new_commit} ({new or '?'}); nothing was changed")
+        cur = G.full_rev(self.repo, self.branch)
+        if cur != old:
+            raise SystemExit(f"{what}: {self.branch} moved from {old[:12]} to "
+                             f"{cur[:12] or '(missing)'} while round {t} was being decided "
+                             f"(another writer?); nothing was changed. Restore the branch to "
+                             f"{old[:12]} and re-run")
+        if kind == "round" and new != old and G.git(
+                self.repo, "merge-base", "--is-ancestor", old, new).returncode != 0:
+            raise SystemExit(f"{what}: {new_commit} does not descend from "
+                             f"{self.branch} at {old[:12]}")
+        rec = {"t": t, "kind": kind, "phase": "pending", "old_commit": old,
+               "new_commit": new, "frontier": fr_new}
+        if history is not None:
+            rec.update(decisions=decisions, history=history)
+        if attribution is not None:
+            rec["attribution"] = attribution
+        atomic_write_json(self.settlement_path, rec)
+        self._apply(rec)
+
+    def _apply(self, rec: dict) -> None:
+        """Apply a `pending` settlement: decisions.json, round t's history rows and
+        (round) its attribution rows, then CAS the branch old -> new (skipped once it
+        is at new), the frontier, and `done`. Every step is idempotent, so a crash
+        anywhere is finished by applying the same record again. A branch at any other
+        commit is a SystemExit before anything is written. A round record from before
+        records carried rows has none; its rows were written before it."""
+        t, kind, old, new = rec["t"], rec["kind"], rec["old_commit"], rec["new_commit"]
+        tip = G.full_rev(self.repo, self.branch)
+        if tip not in (old, new):
+            raise SystemExit(
+                f"cannot apply the pending {kind} settlement of round {t}: {self.branch} "
+                f"moved unexpectedly to {tip[:12] or '(missing)'} (expected {old[:12]} before "
+                f"or {new[:12]} after the settlement). Nothing was changed. Restore the "
+                f"branch to one of those commits and re-run, or remove {self.settlement_path} "
+                f"to abandon this settlement")
+        if rec.get("history") is not None:
+            atomic_write_json(self.runs / f"r{t}" / "decisions.json", rec["decisions"])
+            self.history.rewrite_round(t, rec["history"])
+        if rec.get("attribution") is not None:
+            self._rewrite_attribution(t, rec["attribution"])
+        if tip != new:
+            G.update_ref_cas(self.repo, self.branch, new, old)
+        self.save_frontier(rec["frontier"])
+        atomic_write_json(self.settlement_path, {**rec, "phase": "done"})
+
+    def recover(self) -> int | None:
+        """Finish a settlement left `pending` by a crash by applying its record again
+        (_apply). Idempotent. -> the round t it settled, or None if none was pending.
+        A branch that moved elsewhere is a SystemExit and nothing is changed."""
+        if not self.settlement_path.exists():
+            return None
+        rec = json.loads(self.settlement_path.read_text())
+        if rec.get("phase") != "pending":
+            return None
+        self._apply(rec)
+        if rec["kind"] == "round":
+            self._drop_worktrees(rec["t"])
+        log(self.domain.name, f"recovered the interrupted {rec['kind']} settlement of round "
+            f"{rec['t']}: {self.branch} at {rec['new_commit'][:12]}, frontier trajectory up "
+            f"to t={rec['frontier']['trajectory'][-1]['t']}")
+        return rec["t"]
+
     # --------------------------------------------------------- evidence ---
     def build_traces(self, job: str, per_task: dict) -> dict:
         """Worst trial of the lowest-scoring tasks plus the best trial of the
         highest-scoring ones (success habits the proposer must not break)."""
         ranked = sorted(per_task.items(), key=lambda kv: kv[1].mean)
+        n_wins = self.cfg.n_success_traces
         fails = [t for t, _ in ranked[:self.cfg.n_fail_traces]]
-        wins = [t for t, _ in ranked[-self.cfg.n_success_traces:] if t not in fails]
+        wins = [t for t, _ in (ranked[-n_wins:] if n_wins > 0 else []) if t not in fails]
         traces = {}
         for tid in fails + wins:
             tr = per_task[tid]
@@ -158,6 +262,8 @@ class Run:
 
     def attribute(self, t: int, variant: str, edits: list, inc: EvalResult,
                   cand: EvalResult) -> list:
+        """Attribution rows of one measured candidate (predicted vs observed per-task
+        effects, the proposer's scoreboard). Written by the round's settlement."""
         thr = self.domain.regression_threshold(self.cfg.k)
         rows = []
         for e in edits:
@@ -172,20 +278,38 @@ class Run:
                          "n_predicted": len(pred), "predicted_hit": hits,
                          "hit_rate": round(len(hits) / len(pred), 2) if pred else None,
                          "unpredicted_regressions": [d for d in drops if d not in pred][:12]})
-        with open(self.attribution_path, "a") as f:
-            for r in rows:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
         return rows
+
+    def _rewrite_attribution(self, t: int, rows: list) -> None:
+        """Replace round t's rows of attribution.jsonl by `rows` in one atomic write.
+        Idempotent: re-applying a settlement never duplicates a round's rows."""
+        p = self.attribution_path
+        kept = ([r for r in (json.loads(x) for x in p.read_text().splitlines() if x.strip())
+                 if r.get("t") != t] if p.exists() else [])
+        atomic_write_text(p, "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                     for r in kept + list(rows)))
 
     # ----------------------------------------------------------- baseline --
     def baseline(self, job: str = "base") -> EvalResult:
-        """Evaluate H_0 (the tip of evolve/<domain>) and seed the frontier."""
+        """Evaluate H_0 (the tip of evolve/<domain>) and seed the frontier. A frontier
+        with settled rounds is never reset (a new experiment takes a new runs dir)."""
+        self.recover()                   # a pending settlement must not overwrite it later
+        if self.frontier_path.exists():
+            n = len(self.frontier()["trajectory"])
+            if n > 1:
+                raise SystemExit(f"baseline refused: {self.frontier_path} already has settled "
+                                 f"rounds (trajectory reaches t={n - 1}) and a new baseline "
+                                 f"would reset the run to t=0; nothing was changed. Start a new "
+                                 f"experiment in a new --runs directory")
         self.ensure_branch()
         wt = self.checkout("incumbent", self.branch)
         ids = self.domain.evolve_ids()
         log(self.domain.name, f"baseline: {len(ids)} tasks x k={self.cfg.k} -> job {job}")
-        ev = evaluate(self.domain, wt, self.runs, job, ids, self.cfg.k,
-                      log_prefix=f"{job}")
+        try:
+            ev = evaluate(self.domain, wt, self.runs, job, ids, self.cfg.k, log_prefix=f"{job}",
+                          provenance=self.fingerprint(self.branch, ids))
+        except ProvenanceError as e:
+            raise SystemExit(f"baseline: {e}") from None
         ev.save(self.eval_path(job))
         if ev.missing > self.cfg.invalid_missing_frac * ev.n_expected:
             raise SystemExit(f"baseline invalid: {ev.missing}/{ev.n_expected} trials missing")
@@ -217,11 +341,30 @@ class Run:
 
     def heldout(self, label: str, ids: list[str], ref: str | None = None,
                 k: int | None = None) -> EvalResult:
+        """Evaluate `ref` (default the incumbent branch) on `ids` as job heldout_<label>.
+        A label is bound to one (commit, k, task set): reusing it for anything else, or
+        for a job directory of unknown origin, is refused with the evidence untouched."""
         ref = ref or self.branch
-        wt = self.checkout(f"heldout_{label}", ref)
+        k = k or self.cfg.k
         job = f"heldout_{label}"
-        ev = evaluate(self.domain, wt, self.runs, job, ids, k or self.cfg.k,
-                      log_prefix=job)
+        try:
+            fp = self.fingerprint(ref, ids, k)
+            recorded = read_manifest(self.runs, job)
+        except ProvenanceError as e:
+            raise SystemExit(f"heldout {label}: {e}") from None
+        if recorded is None and (self.jobs / job).exists():
+            raise SystemExit(f"heldout {label}: {self.jobs / job} already exists but has no "
+                             f"evaluation manifest (legacy or unknown origin), so its harness "
+                             f"cannot be verified; nothing was changed. Use a new --label")
+        if recorded is not None:
+            bad = mismatches(fp, recorded)
+            if bad:
+                raise SystemExit(f"heldout {label}: label already used for commit "
+                                 f"{recorded.get('commit')}, refusing to evaluate commit "
+                                 f"{fp['commit']} under it ({'; '.join(bad)}); the recorded "
+                                 f"results are kept. Use a new --label")
+        wt = self.checkout(f"heldout_{label}", ref)
+        ev = evaluate(self.domain, wt, self.runs, job, ids, k, log_prefix=job, provenance=fp)
         ev.save(self.eval_path(job))
         log(self.domain.name, f"heldout {label} @ {G.rev(self.repo, ref)}: S={ev.S:.4f} "
             f"C={ev.C} missing={ev.missing}/{ev.n_expected} {json.dumps(ev.extra)[:200]}")
@@ -229,15 +372,28 @@ class Run:
 
     # -------------------------------------------------------------- round --
     def round(self, t: int, dry_run: bool = False) -> None:
+        """Round t from H_t to H_{t+1}. Preconditions are checked before any
+        analysis or paid work: round t is not yet settled, every earlier round is,
+        and evolve/<domain> still carries H_t's harness tree."""
         d, cfg = self.domain, self.cfg
+        if self.recover() == t:
+            log(d.name, f"round {t} settled by recovering its interrupted settlement")
+            return
         fr = self.frontier()
         inc = fr["incumbent"]
+        n = len(fr["trajectory"])
+        if n > t + 1:
+            raise SystemExit(f"round {t} is already settled (frontier trajectory reaches "
+                             f"t={n - 1}); nothing was changed. To revise it use "
+                             f"`readjudicate --t {t}` or `reevaluate --t {t}` (only while it is "
+                             f"the most recently settled round and round {t + 1} has not started)")
+        if n < t + 1:
+            raise SystemExit(f"round {t} needs trajectory up to t={t}; have "
+                             f"{n} entries (run earlier rounds)")
         if inc["harness_tree"] != self.harness_tree(self.branch):
             raise SystemExit(f"harness tree of {self.branch} != frontier "
                              f"({self.harness_tree(self.branch)} vs {inc['harness_tree']})")
-        if len(fr["trajectory"]) < t + 1:
-            raise SystemExit(f"round {t} needs trajectory up to t={t}; have "
-                             f"{len(fr['trajectory'])} entries (run earlier rounds)")
+        tip = G.full_rev(self.repo, self.branch)     # settlement CASes the branch from here
         delta = self.delta()
         rdir = self.runs / f"r{t}"
         rdir.mkdir(exist_ok=True)
@@ -300,69 +456,72 @@ class Run:
         live = [c for c in cands if c.gate_failure is None]
         with ThreadPoolExecutor(max_workers=max(1, cfg.eval_parallel)) as ex:
             list(ex.map(lambda c: self._evaluate(t, c, rdir, ids), live))
+        if live and all(c.gate_failure == "eval_invalid" for c in live):
+            raise SystemExit(f"round {t} not settled: every screened candidate "
+                             f"({', '.join(c.variant for c in live)}) failed evaluation "
+                             f"(infrastructure). Re-run the round once the evaluator works; "
+                             f"completed drafts and evaluations are reused")
 
-        # 6) Algorithm 2: admissibility, argmax, S*, history
-        counts = self.history.incumbent_component_counts()
+        # 6) Algorithm 2: admissibility, argmax, S*. The decisions, history and
+        #    attribution rows stay in memory until the settlement record carries them.
+        counts = self._counts_before(t)
         winner, decisions = select_round(cands, inc_ev, fr["S_star"], delta, cfg,
                                          counts, guard_fn=d.guards)
-        (rdir / "decisions.json").write_text(json.dumps(
-            [x.to_json() for x in decisions], indent=1))
+        rows, attribution = [], []
         for c, dec in zip(cands, decisions):
-            if self.history.has(t, c.variant):
-                continue                      # resumed round: already recorded
             if c.ev is None:
-                outcome = c.gate_failure or "not_evaluated"
-                self.history.append_candidate(t, c.variant, c.edits, outcome, None, None,
-                                              False, None, None, c.diff_path, c.detail)
+                rows += self.history.candidate_rows(t, c.variant, c.edits,
+                                                    c.gate_failure or "not_evaluated", None,
+                                                    None, False, None, None, c.diff_path, c.detail)
                 continue
             outcome = ("ACCEPTED" if c is winner else
                        ("LOST" if dec.admissible else "REJECTED"))
-            self.history.append_candidate(t, c.variant, c.edits, outcome, dec.delta_S,
-                                          dec.delta_C, c is winner, dec.S, dec.C,
-                                          c.diff_path, dec.reason)
-            self.attribute(t, c.variant, c.edits, inc_ev, c.ev)
+            rows += self.history.candidate_rows(t, c.variant, c.edits, outcome, dec.delta_S,
+                                                dec.delta_C, c is winner, dec.S, dec.C,
+                                                c.diff_path, dec.reason)
+            attribution += self.attribute(t, c.variant, c.edits, inc_ev, c.ev)
             log(d.name, f"{c.variant}: S={dec.S:.4f} dS={dec.delta_S:+.4f} "
-                f"dC={dec.delta_C:+.3f} nu={dec.novelty} -> {outcome}: {dec.reason}")
+                f"dC={_fmt_dc(dec.delta_C)} cov={_fmt_cov(dec.token_coverage)} "
+                f"nu={dec.novelty} -> {outcome}: {dec.reason}")
 
-        # 7) H_{t+1}
+        # 7) H_{t+1}: decisions, history, branch and frontier move together (_settle)
         if winner is not None:
-            G.fast_forward(self.repo, self.branch, winner.commit)
             new_S, new_C = winner.ev.S, winner.ev.C
             fr["incumbent"] = {"t": t + 1, "commit": winner.commit,
                                "harness_tree": self.harness_tree(winner.commit),
                                "job": winner.ev.job, "S": new_S, "C": new_C,
                                "extra": winner.ev.extra, "variant": winner.variant}
             fr["S_star"] = max(fr["S_star"], new_S)
-            log(d.name, f"ACCEPTED r{t}{winner.variant} -> {winner.commit} "
-                f"S={new_S:.4f} S*={fr['S_star']:.4f}")
         else:
             new_S, new_C = inc_ev.S, inc_ev.C
-            log(d.name, f"no admissible candidate; H_{t+1} = H_{t}")
         traj_entry = {"t": t + 1, "S": new_S, "C": new_C,
                       "commit": fr["incumbent"]["commit"], "job": fr["incumbent"]["job"]}
         fr["trajectory"] = [x for x in fr["trajectory"] if x["t"] <= t] + [traj_entry]
-        self.save_frontier(fr)
-        for c in cands:
-            G.worktree_remove(self.repo, self.wt_root / f"r{t}{c.variant}")
+        self._settle(t, "round", winner.commit if winner is not None else tip, fr, old=tip,
+                     decisions=[x.to_json() for x in decisions], history=rows,
+                     attribution=attribution)
+        if winner is not None:
+            log(d.name, f"ACCEPTED r{t}{winner.variant} -> {winner.commit} "
+                f"S={new_S:.4f} S*={fr['S_star']:.4f}")
+        else:
+            log(d.name, f"no admissible candidate; H_{t+1} = H_{t}")
+        self._drop_worktrees(t)
 
     def readjudicate(self, t: int) -> None:
         """Re-run Algorithm 2 on the STORED measurements of round t, after a
         change of delta or of the acceptance weights. No new evaluation is
         spent: every candidate keeps the (S', C') it was measured at against
-        the incumbent H_t it was drafted from. Rounds after t must have been
-        removed first, since their candidates were drafted from the old H_{t+1}."""
+        the incumbent H_t it was drafted from. Only the most recently settled round,
+        and only before round t+1 has started (_adjudicable), since a later round is
+        drafted from the H_{t+1} being revised."""
         d, cfg = self.domain, self.cfg
+        self.recover()
         fr = self.frontier()
-        if len(fr["trajectory"]) > t + 2:
-            raise SystemExit(f"rounds after {t} exist in the frontier; remove them first")
-        inc_entry = fr["trajectory"][t]
-        inc_job = inc_entry.get("job") or ("base" if t == 0 else None)
-        if not inc_job:
-            raise SystemExit(f"trajectory[{t}] has no job; cannot locate H_{t}'s evaluation")
+        rdir, inc_entry, inc_job = self._adjudicable(fr, t)
+        tip = G.full_rev(self.repo, self.branch)     # settlement CASes the branch from here
         inc_ev = EvalResult.load(self.eval_path(inc_job))
         S_star = max(x["S"] for x in fr["trajectory"][:t + 1])
         delta = self.delta()
-        rdir = self.runs / f"r{t}"
         cands = []
         for vdir in sorted(p for p in rdir.iterdir() if p.is_dir() and len(p.name) == 1):
             prep = (json.loads((vdir / "prep.json").read_text())
@@ -375,31 +534,26 @@ class Run:
             elif not c.gate_failure:
                 c.gate_failure = "eval_invalid"
             cands.append(c)
-        counts = {k: 0 for k in self.history.incumbent_component_counts()}
-        for r in self.history.records():
-            if r.get("accepted") and r.get("t", 10**9) < t and r.get("component") in counts:
-                counts[r["component"]] += 1
-        winner, decisions = select_round(cands, inc_ev, S_star, delta, cfg, counts,
-                                         guard_fn=d.guards)
-        (rdir / "decisions.json").write_text(json.dumps(
-            [x.to_json() for x in decisions], indent=1))
-        self.history.replace_round(t)
+        winner, decisions = select_round(cands, inc_ev, S_star, delta, cfg,
+                                         self._counts_before(t), guard_fn=d.guards)
+        if winner is not None and G.git(self.repo, "merge-base", "--is-ancestor",
+                                        inc_entry["commit"], winner.commit).returncode != 0:
+            raise SystemExit(f"{winner.commit} does not descend from H_{t} {inc_entry['commit']}")
+        rows = []                        # round t's complete history, written by the settlement
         for c, dec in zip(cands, decisions):
             if c.ev is None:
-                self.history.append_candidate(t, c.variant, c.edits, c.gate_failure or "not_evaluated",
-                                              None, None, False, None, None, c.diff_path, c.detail)
+                rows += self.history.candidate_rows(t, c.variant, c.edits,
+                                                    c.gate_failure or "not_evaluated", None, None,
+                                                    False, None, None, c.diff_path, c.detail)
                 continue
             outcome = ("ACCEPTED" if c is winner else ("LOST" if dec.admissible else "REJECTED"))
-            self.history.append_candidate(t, c.variant, c.edits, outcome, dec.delta_S, dec.delta_C,
-                                          c is winner, dec.S, dec.C, c.diff_path,
-                                          f"[re-adjudicated delta={delta:.5f}] " + dec.reason)
-            log(d.name, f"r{t}{c.variant}: S={dec.S:.4f} dS={dec.delta_S:+.4f} dC={dec.delta_C:+.3f} "
-                f"-> {outcome}: {dec.reason}")
+            rows += self.history.candidate_rows(t, c.variant, c.edits, outcome, dec.delta_S,
+                                                dec.delta_C, c is winner, dec.S, dec.C, c.diff_path,
+                                                f"[re-adjudicated delta={delta:.5f}] " + dec.reason)
+            log(d.name, f"r{t}{c.variant}: S={dec.S:.4f} dS={dec.delta_S:+.4f} dC={_fmt_dc(dec.delta_C)} "
+                f"cov={_fmt_cov(dec.token_coverage)} -> {outcome}: {dec.reason}")
         if winner is not None:
-            r = G.git(self.repo, "merge-base", "--is-ancestor", inc_entry["commit"], winner.commit)
-            if r.returncode != 0:
-                raise SystemExit(f"{winner.commit} does not descend from H_{t} {inc_entry['commit']}")
-            G.git(self.repo, "update-ref", f"refs/heads/{self.branch}", winner.commit, check=True)
+            new_commit = winner.commit
             new = {"t": t + 1, "commit": winner.commit, "harness_tree": self.harness_tree(winner.commit),
                    "job": winner.ev.job, "S": winner.ev.S, "C": winner.ev.C,
                    "extra": winner.ev.extra, "variant": winner.variant}
@@ -407,27 +561,36 @@ class Run:
             fr["S_star"] = max(S_star, winner.ev.S)
             entry = {"t": t + 1, "S": winner.ev.S, "C": winner.ev.C, "commit": winner.commit,
                      "job": winner.ev.job}
-            log(d.name, f"re-adjudicated r{t}: ACCEPTED {winner.variant} -> {winner.commit} "
-                f"S={winner.ev.S:.4f} S*={fr['S_star']:.4f}")
         else:
-            G.git(self.repo, "update-ref", f"refs/heads/{self.branch}", inc_entry["commit"], check=True)
+            new_commit = inc_entry["commit"]
             fr["incumbent"] = {"t": t + 1, "commit": inc_entry["commit"],
                                "harness_tree": self.harness_tree(inc_entry["commit"]),
                                "job": inc_job, "S": inc_ev.S, "C": inc_ev.C, "extra": inc_ev.extra}
             fr["S_star"] = S_star
             entry = {"t": t + 1, "S": inc_ev.S, "C": inc_ev.C, "commit": inc_entry["commit"],
                      "job": inc_job}
-            log(d.name, f"re-adjudicated r{t}: no admissible candidate; H_{t+1} = H_{t}")
         fr["trajectory"] = fr["trajectory"][:t + 1] + [entry]
-        self.save_frontier(fr)
+        self._settle(t, "readjudicate", new_commit, fr, old=tip,
+                     decisions=[x.to_json() for x in decisions], history=rows)
+        if winner is not None:
+            log(d.name, f"re-adjudicated r{t}: ACCEPTED {winner.variant} -> {winner.commit} "
+                f"S={winner.ev.S:.4f} S*={fr['S_star']:.4f}")
+        else:
+            log(d.name, f"re-adjudicated r{t}: no admissible candidate; H_{t+1} = H_{t}")
 
     def reevaluate(self, t: int, variants: list[str] | None = None) -> None:
-        """Re-measure the stored (committed) candidates of round t whose evaluation
-        was invalid or corrupted by an infrastructure failure, then re-adjudicate
-        the round. Rounds after t must have been removed first."""
+        """Re-measure the stored (committed) candidates of round t after an
+        infrastructure failure, then re-adjudicate the round. Everything is checked
+        before anything is run or written: the readjudicate preconditions, and that
+        each selected candidate's evaluation identity (commit, harness tree, k, tasks)
+        still matches its manifest and its cached eval.json. A valid re-measurement
+        replaces eval.json; an invalid one keeps the previous file; if none is valid,
+        the round is not re-adjudicated (SystemExit)."""
         d = self.domain
-        rdir = self.runs / f"r{t}"
+        self.recover()
+        rdir, _, _ = self._adjudicable(self.frontier(), t)
         ids = d.evolve_ids()
+        todo = []                        # (candidate, fingerprint) re-measured below
         for vdir in sorted(p for p in rdir.iterdir() if p.is_dir() and len(p.name) == 1):
             if variants and vdir.name not in variants:
                 continue
@@ -436,20 +599,112 @@ class Run:
             if not prep.get("commit") or not G.branch_exists(self.repo, prep.get("branch", "")):
                 log(d.name, f"r{t}{vdir.name}: no committed candidate to re-evaluate")
                 continue
-            (vdir / "eval.json").unlink(missing_ok=True)
-            wt = self.wt_root / f"r{t}{vdir.name}"
-            G.worktree_remove(self.repo, wt)
-            G.git(self.repo, "worktree", "add", str(wt), prep["branch"], check=True)
-            c = Candidate(vdir.name, prep.get("edits") or [], diff_path=prep.get("diff_path"),
-                          branch=prep["branch"], commit=prep["commit"])
-            self._evaluate(t, c, rdir, ids)
-            log(d.name, f"r{t}{vdir.name}: re-evaluated -> "
-                + (f"S={c.ev.S:.4f} C={c.ev.C} missing={c.ev.missing}" if c.ev else
-                   f"{c.gate_failure}: {c.detail}"))
-            G.worktree_remove(self.repo, wt)
+            job, ep = f"r{t}{vdir.name}", vdir / "eval.json"
+            try:
+                fp = self.fingerprint(prep["commit"], ids)
+                recorded = [(manifest_path(self.runs, job), read_manifest(self.runs, job))]
+            except ProvenanceError as e:
+                raise SystemExit(f"reevaluate r{t}: {e}. Nothing was changed") from None
+            if ep.exists():
+                recorded.append((ep, EvalResult.load(ep).provenance))
+            for src, prov in recorded:
+                bad = mismatches(fp, prov) if prov is not None else []
+                if bad:
+                    raise SystemExit(
+                        f"reevaluate r{t}: {src} was recorded for a different evaluation than "
+                        f"re-measuring {job} now requires ({'; '.join(bad)}). Nothing was "
+                        f"changed. " + move_aside(self.runs, job, ep))
+            todo.append((Candidate(vdir.name, prep.get("edits") or [],
+                                   diff_path=prep.get("diff_path"), branch=prep["branch"],
+                                   commit=prep["commit"]), fp))
+        if not todo:
+            raise SystemExit(f"reevaluate r{t}: no committed candidate "
+                             f"{'among ' + ','.join(variants) + ' ' if variants else ''}"
+                             f"to re-measure; nothing was changed")
+        valid = []
+        for c, fp in todo:
+            job, ep = f"r{t}{c.variant}", rdir / c.variant / "eval.json"
+            wt = self.wt_root / job
+            try:
+                G.worktree_remove(self.repo, wt)
+                G.git(self.repo, "worktree", "add", str(wt), c.branch, check=True)
+                ev = self._measure(t, c, ids, fp)
+            finally:
+                G.worktree_remove(self.repo, wt)
+            if ev is None:
+                log(d.name, f"r{t}{c.variant}: re-measurement invalid ({c.gate_failure}: "
+                    f"{c.detail}); " + ("the previous eval.json is kept" if ep.exists()
+                                        else "it has no eval.json"))
+                continue
+            ev.save(ep)
+            ev.save(self.eval_path(job))
+            valid.append(c.variant)
+            log(d.name, f"r{t}{c.variant}: re-evaluated -> S={ev.S:.4f} C={ev.C} "
+                f"missing={ev.missing}")
+        if not valid:
+            raise SystemExit(f"reevaluate r{t}: every re-measured candidate "
+                             f"({', '.join(c.variant for c, _ in todo)}) failed evaluation "
+                             f"again (infrastructure); the previous evaluations are kept and "
+                             f"round {t} was not re-adjudicated. Re-run once the evaluator works")
         self.readjudicate(t)
 
     # ------------------------------------------------------------ helpers --
+    def _adjudicable(self, fr: dict, t: int) -> tuple[Path, dict, str]:
+        """Preconditions of readjudicate / reevaluate, checked before anything is
+        re-measured or written: round t is the most recently settled round and round
+        t+1 has not started (no r<t+1>/), since a later round is drafted from the
+        H_{t+1} being revised; H_t and its evaluation exist, round t was drafted, and
+        a noise band is available. -> (round dir, trajectory[t], H_t's job)."""
+        n = len(fr["trajectory"])
+        if n > t + 2:
+            raise SystemExit(f"rounds after {t} exist in the frontier (trajectory reaches "
+                             f"t={n - 1}); readjudicate and reevaluate apply only to the most "
+                             f"recently settled round. Nothing was changed")
+        if n < t + 1:
+            raise SystemExit(f"round {t} has no incumbent H_{t} in the frontier "
+                             f"({n} trajectory entries)")
+        if n == t + 1:
+            raise SystemExit(f"round {t} is not settled (frontier trajectory reaches t={t}); "
+                             f"readjudicate and reevaluate revise a settled round only. An "
+                             f"unsettled round is resumed by re-running `round --t {t}`. "
+                             f"Nothing was changed")
+        nxt, u = self.runs / f"r{t + 1}", t + 1
+        if nxt.exists():
+            v = f"[{VARIANT_LABELS[0]}-{VARIANT_LABELS[-1]}]"
+            raise SystemExit(
+                f"round {u} has started ({nxt} exists) from the H_{u} that round {t} settled, "
+                f"so round {t} can no longer be revised. Nothing was changed. An unsettled "
+                f"round is resumed by re-running `round --t {u}`, not readjudicated. To revise "
+                f"round {t} instead, first move aside everything round {u} wrote: {nxt}/, the "
+                f"branches {self.domain.name}/r{u}{v}* with their worktrees "
+                f"{self.wt_root}/r{u}{v}*, {self.jobs}/r{u}{v}* and "
+                f"{self.runs / 'manifests'}/r{u}{v}*.json")
+        inc_entry = fr["trajectory"][t]
+        inc_job = inc_entry.get("job") or ("base" if t == 0 else None)
+        if not inc_job or not self.eval_path(inc_job).exists():
+            raise SystemExit(f"trajectory[{t}] has no stored evaluation (job {inc_job}); "
+                             f"cannot locate H_{t}'s evaluation")
+        rdir = self.runs / f"r{t}"
+        if not rdir.is_dir():
+            raise SystemExit(f"no {rdir}: round {t} has no stored candidates")
+        self.delta()
+        return rdir, inc_entry, inc_job
+
+    def _counts_before(self, t: int) -> dict:
+        """Accepted edits per component over rounds < t: the machinery H_t carries
+        (novelty counts). A resumed or re-adjudicated round never counts its own
+        records."""
+        counts = {k: 0 for k in self.history.incumbent_component_counts()}
+        for r in self.history.records():
+            if r.get("accepted") and r.get("t", 10**9) < t and r.get("component") in counts:
+                counts[r["component"]] += 1
+        return counts
+
+    def _drop_worktrees(self, t: int) -> None:
+        for v in VARIANT_LABELS:
+            if (self.wt_root / f"r{t}{v}").exists():
+                G.worktree_remove(self.repo, self.wt_root / f"r{t}{v}")
+
     def _draft(self, t, vid, rdir, report, digests, traces, inc_ev, budget, explore,
                reserved, prune, hist_rows, skill_md, patterns_md) -> Candidate:
         d, cfg = self.domain, self.cfg
@@ -479,7 +734,7 @@ class Run:
                          f"admissible one becomes H_{t + 1}.")
 
         def finish(gate_failure: str, detail: str = "", edits=None, diff_path=None):
-            prep_path.write_text(json.dumps(
+            atomic_write_text(prep_path, json.dumps(
                 {"gate_failure": gate_failure, "detail": detail, "edits": edits or [],
                  "diff_path": diff_path}, ensure_ascii=False, indent=1))
             G.worktree_remove(self.repo, wt, branch)
@@ -566,7 +821,7 @@ class Run:
         if not ok:
             return finish("smoke_fail", json.dumps(detail)[:600], edits,
                           str(vdir / "diff.patch"))
-        prep_path.write_text(json.dumps(
+        atomic_write_text(prep_path, json.dumps(
             {"commit": commit, "branch": branch, "edits": edits,
              "diff_path": str(vdir / "diff.patch"), "mechanism": prop.get("mechanism")},
             ensure_ascii=False, indent=1))
@@ -576,30 +831,54 @@ class Run:
                          branch=branch, commit=commit)
 
     def _evaluate(self, t: int, c: Candidate, rdir: Path, ids: list[str]) -> None:
-        d, cfg = self.domain, self.cfg
+        """c.ev <- the candidate's cached eval.json when its identity matches (a
+        mismatch is a SystemExit, the file kept), else a fresh valid measurement
+        (_measure), saved; an invalid one leaves c.gate_failure set."""
+        d = self.domain
         job = f"r{t}{c.variant}"
         ep = rdir / c.variant / "eval.json"
+        fp = self.fingerprint(c.commit, ids)
         if ep.exists():
-            c.ev = EvalResult.load(ep)
-            log(d.name, f"{c.variant}: reusing eval.json")
+            cached = EvalResult.load(ep)
+            if cached.provenance is None:
+                log(d.name, f"{c.variant}: WARNING reusing {ep} without provenance (legacy "
+                    f"artifact: its harness, tasks and k are not verified)")
+            else:
+                bad = mismatches(fp, cached.provenance)
+                if bad:
+                    raise SystemExit(f"{ep} was measured for a different evaluation than "
+                                     f"{job} now requires ({'; '.join(bad)}); it is kept and "
+                                     f"nothing was run. " + move_aside(self.runs, job, ep))
+                log(d.name, f"{c.variant}: reusing eval.json")
+            c.ev = cached
             return
-        wt = self.wt_root / job
+        ev = self._measure(t, c, ids, fp)
+        if ev is not None:
+            ev.save(ep)
+            ev.save(self.eval_path(job))
+            c.ev = ev
+
+    def _measure(self, t: int, c: Candidate, ids: list[str], fp: dict) -> EvalResult | None:
+        """Evaluate(H', D_evolve, k) of candidate c in its worktree wt/r<t><v> under
+        identity `fp`, retried once when too many trials are missing. Saves nothing.
+        -> the valid result, or None with c.gate_failure / c.detail set."""
+        d, cfg = self.domain, self.cfg
+        job = f"r{t}{c.variant}"
         ev = None
         for attempt in range(2):
             try:
-                ev = evaluate(d, wt, self.runs, job, ids, cfg.k, log_prefix=job)
+                ev = evaluate(d, self.wt_root / job, self.runs, job, ids, cfg.k, log_prefix=job,
+                              provenance=fp)
+            except ProvenanceError:
+                raise                    # an operator error (a job name reused), not infrastructure
             except Exception as e:  # noqa: BLE001
                 c.gate_failure, c.detail = "eval_invalid", f"evaluation crashed: {e!r}"[:600]
                 log(d.name, f"{c.variant}: {c.detail}")
-                return
+                return None
             if ev.missing <= cfg.invalid_missing_frac * ev.n_expected:
-                break
+                return ev
             log(d.name, f"{c.variant}: {ev.missing}/{ev.n_expected} trials missing "
                 f"(infrastructure){'; retrying once' if attempt == 0 else ''}")
-        if ev.missing > cfg.invalid_missing_frac * ev.n_expected:
-            c.gate_failure = "eval_invalid"
-            c.detail = f"{ev.missing}/{ev.n_expected} trials missing (infrastructure) after a retry"
-            return
-        ev.save(ep)
-        ev.save(self.eval_path(job))
-        c.ev = ev
+        c.gate_failure = "eval_invalid"
+        c.detail = f"{ev.missing}/{ev.n_expected} trials missing (infrastructure) after a retry"
+        return None

@@ -36,15 +36,20 @@ texts that make the three search roles speak the benchmark's language.
     render_trace       what the analyst/digester/proposer read
     task_row           one-line summary per trace in the task tables
     smoke              liveness check before evaluation (not a selection rule)
+    doctor_checks      offline prerequisite checks for `doctor` (rrsi.doctor)
     critic_patterns    deterministic leakage denylist   rrsi.critic
     component_signals  diff regexes -> component tag    rrsi.components
     guards             non-compensatory domain checks   rrsi.selection (Sec. 3.3)
     briefs             domain paragraphs for analyst / digester / proposer / critic
+
+Each domain is the package `domains.<name>` (adapter, briefs, render, ...), imported by
+its qualified name so two domains loaded in one process never share a sibling module.
+`validate_domain` checks an adapter against this contract without loading a task set.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
@@ -103,6 +108,11 @@ class Domain:
     briefs: dict = {}                    # analyst / digester / proposer / critic
     source_exts: set = {".py", ".txt", ".md", ".json"}
 
+    def doctor_checks(self) -> list:
+        """Cheap filesystem / PATH checks (rrsi.doctor.CheckResult) for this domain's
+        external prerequisites. No model call, no benchmark run."""
+        return []
+
     def harness_dir(self, root: Path) -> Path:
         return (root / "domains" / self.name / self.harness_path).resolve()
 
@@ -111,14 +121,47 @@ class Domain:
         return (d / "SKILL.md").read_text(), (d / "PATTERNS.md").read_text()
 
 
+# Overridden by every adapter; the base class raises NotImplementedError for each.
+REQUIRED_METHODS = ("evolve_ids", "smoke_ids", "run", "score", "load_trial",
+                    "render_trace", "task_row", "smoke")
+REQUIRED_BRIEFS = ("analyst", "digester", "proposer", "critic")
+CONSTITUTION_FILES = ("SKILL.md", "PATTERNS.md")
+
+
 def load_domain(name: str) -> Domain:
     p = DOMAINS / name / "adapter.py"
     if not p.is_file():
         raise SystemExit(f"unknown domain {name!r} (no {p})")
-    spec = importlib.util.spec_from_file_location(f"domains.{name}.adapter", p)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    mod = importlib.import_module(f"domains.{name}.adapter")
     dom = mod.DOMAIN
     dom.root = DOMAINS / name
     return dom
+
+
+def validate_domain(domain: Domain) -> list[str]:
+    """Contract problems of an adapter, empty if it is complete: the methods the base class
+    leaves abstract are overridden, all four briefs are non-empty text, and the constitution
+    files exist under `domain.root`. Cheap and offline: it never calls evolve_ids() or reads a
+    benchmark checkout."""
+    out = []
+    cls = type(domain)
+    for m in REQUIRED_METHODS:
+        if getattr(cls, m, None) is getattr(Domain, m):
+            out.append(f"{m}() is not overridden")
+    briefs = getattr(domain, "briefs", None)
+    if not isinstance(briefs, dict):
+        out.append("briefs is not a dict")
+        briefs = {}
+    for k in REQUIRED_BRIEFS:
+        v = briefs.get(k)
+        if not (isinstance(v, str) and v.strip()):
+            out.append(f"briefs[{k!r}] is missing or empty")
+    root = getattr(domain, "root", None)
+    if root is None:
+        out.append("root is not set")
+    else:
+        out += [f"{f} is missing under {root}" for f in CONSTITUTION_FILES
+                if not (Path(root) / f).is_file()]
+    return out

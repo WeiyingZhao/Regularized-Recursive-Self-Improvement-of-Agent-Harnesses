@@ -30,3 +30,16 @@ Guidelines](https://opensource.google/conduct/).
 All submissions, including submissions by project members, require review. We
 use [GitHub pull requests](https://docs.github.com/articles/about-pull-requests)
 for this purpose.
+
+### Running tests
+
+```bash
+python3 -m pytest -q
+```
+
+Run it from the repository root. The suite is offline: it makes no model call
+and needs no `anthropic` package, cloud credentials, Docker or benchmark
+checkout, so keep new tests free of them too. GitHub Actions
+(`.github/workflows/tests.yml`) runs the same command on Python 3.10, 3.11 and
+3.12 with only `pytest` installed. Add or extend a test with every behavior
+change.

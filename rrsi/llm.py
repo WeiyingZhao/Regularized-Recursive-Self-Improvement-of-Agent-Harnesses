@@ -52,6 +52,8 @@ MAX_TOKENS = 20_000
 _clients: dict = {}
 _clients_lock = threading.Lock()
 _rr = itertools.count()
+_NO_PROJECTS = ("set RRSI_VERTEX_PROJECTS to a comma-separated list of GCP "
+                "projects with Claude on Vertex AI enabled")
 _JSON_SUFFIX = ("\n\nOutput ONLY a single valid JSON object. No prose before or "
                 "after, no markdown fences.")
 
@@ -59,8 +61,7 @@ _JSON_SUFFIX = ("\n\nOutput ONLY a single valid JSON object. No prose before or 
 def _client_for(idx: int):
     from anthropic import AnthropicVertex
     if not _PROJECTS:
-        raise RuntimeError("set RRSI_VERTEX_PROJECTS to a comma-separated list of GCP "
-                           "projects with Claude on Vertex AI enabled")
+        raise RuntimeError(_NO_PROJECTS)
     with _clients_lock:
         c = _clients.get(idx)
         if c is None:
@@ -92,6 +93,8 @@ def extract_json(text: str) -> str:
 def generate(prompt: str, system: str | None = None, max_retries: int = 6,
              json_only: bool = False, model: str | None = None,
              max_tokens: int = MAX_TOKENS, cache_prefix: str | None = None) -> str:
+    if not _PROJECTS:
+        raise RuntimeError(_NO_PROJECTS)
     mdl = model or MODEL
     sys_prompt = (system or "") + (_JSON_SUFFIX if json_only else "")
     content = ([{"type": "text", "text": cache_prefix,

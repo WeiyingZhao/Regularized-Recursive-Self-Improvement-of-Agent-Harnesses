@@ -40,21 +40,38 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent.parent))
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent.parent))  # the repo root only: siblings are `domains.<name>.*`
+from rrsi.doctor import CheckResult    # noqa: E402
 from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
-import briefs                            # noqa: E402
-import render                            # noqa: E402
+from domains.coding import briefs, render  # noqa: E402
 
 CFG = json.loads((HERE / "rrsi.json").read_text())
-PYBIN = os.environ.get("RRSI_CODING_PYTHON", str(HERE / ".venv" / "bin" / "python"))
+
+
+def coding_runtime(environ) -> dict:
+    """The one resolution of the harbor venv and interpreter; smoke and evaluation
+    both derive from it, and a user-set RRSI_CODING_VENV / RRSI_CODING_PYTHON wins."""
+    venv = Path(environ.get("RRSI_CODING_VENV") or HERE / ".venv").resolve()
+    return {"venv": str(venv),
+            "python": environ.get("RRSI_CODING_PYTHON") or str(venv / "bin" / "python")}
+
+
+def harbor_env(root, environ) -> dict:
+    """Environment for scripts/run_eval.sh, run from `root`'s worktree."""
+    return {**environ, "RRSI_CODING_ROOT": str(Path(root) / "domains" / "coding"),
+            "RRSI_CODING_VENV": coding_runtime(environ)["venv"],
+            "MODEL": CFG.get("policy_model", "vertex_ai/gemini-3.5-flash")}
+
+
+PYBIN = coding_runtime(os.environ)["python"]
 
 
 def _load_result(trial_dir: Path) -> dict | None:
@@ -150,6 +167,19 @@ class CodingDomain(Domain):
     def smoke_ids(self, incumbent_per_task=None) -> list[str]:
         return list(CFG["smoke_tasks"])
 
+    def doctor_checks(self) -> list:
+        py = coding_runtime(os.environ)["python"]
+        docker = shutil.which("docker")
+        return [
+            CheckResult("coding python", "ok", py) if Path(py).is_file() or shutil.which(py)
+            else CheckResult("coding python", "fail", f"{py} not found",
+                             "python3 -m venv domains/coding/.venv && domains/coding/.venv/bin/pip "
+                             "install 'harbor>=0.18'   # or set RRSI_CODING_VENV / RRSI_CODING_PYTHON"),
+            CheckResult("docker", "ok", docker) if docker
+            else CheckResult("docker", "fail", "docker is not on PATH",
+                             "install Docker (harbor runs every trial in a container)"),
+        ]
+
     # ---- Evaluate ----------------------------------------------------------
     def _harbor(self, root: Path, runs_dir: Path, job: str, ids: list[str] | None,
                 k: int, dataset: str, log_prefix: str) -> None:
@@ -176,9 +206,7 @@ class CodingDomain(Domain):
         if ids is not None and set(ids) != set(self._tasks):
             for t in ids:
                 cmd += ["-i", f"terminal-bench/{t}"]
-        env = {**os.environ, "RRSI_CODING_ROOT": str(root / "domains" / "coding"),
-               "RRSI_CODING_VENV": str((HERE / ".venv").resolve()),
-               "MODEL": CFG.get("policy_model", "vertex_ai/gemini-3.5-flash")}
+        env = harbor_env(root, os.environ)
         log = runs_dir / "logs" / f"{log_prefix or job}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a") as lf:

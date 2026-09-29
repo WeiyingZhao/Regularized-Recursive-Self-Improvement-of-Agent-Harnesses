@@ -101,7 +101,7 @@ CANDIDATE_REL = "submission/payload.py"
 
 # ---- MCP gateway -------------------------------------------------------------
 GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
-GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8994"))
+GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8996"))
 GATEWAY_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}/mcp/"
 
 # ---- Agent config ------------------------------------------------------------

@@ -52,7 +52,7 @@ echo "$SURFACE $$ $(date -Is)" >&9
 
 export RRSI_RUNS_DIR="$RUNS" RRSI_SPLIT_PATH="$DOM/data/split_engd.json"
 export GRADING_PYTHON="${GRADING_PYTHON:-$(readlink -f "$DOM/.venvs")/engdesign/bin/python}"
-export WORKSPACE_BASE="$RUNS/workspaces" GATEWAY_PORT="${GATEWAY_PORT:-8994}" AGENT_PYTHON="$PY"
+export WORKSPACE_BASE="$RUNS/workspaces" GATEWAY_PORT="${GATEWAY_PORT:-8996}" AGENT_PYTHON="$PY"
 mkdir -p "$RUNS/logs" "$WORKSPACE_BASE"
 bash "$DOM/scripts/gateway.sh" start || exit 1
 

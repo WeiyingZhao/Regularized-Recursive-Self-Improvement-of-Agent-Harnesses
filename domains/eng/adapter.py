@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -48,12 +49,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent.parent))
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent.parent))  # the repo root only: siblings are `domains.<name>.*`
+from rrsi.doctor import CheckResult    # noqa: E402
 from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
-import briefs                            # noqa: E402
-import render                            # noqa: E402
+from domains.eng import briefs, render  # noqa: E402
 
 CFG = json.loads((HERE / "rrsi.json").read_text())
 SPLIT = json.loads((HERE / "data" / "split_engd.json").read_text())
@@ -71,6 +71,45 @@ def _port_up(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
     finally:
         s.close()
+
+
+def gateway_identity_issue(workspace_base: Path, port: int) -> str | None:
+    """None when `workspace_base` holds a live identity file for the gateway on `port`
+    (written by scripts/gateway.sh start); else why the listener cannot be trusted."""
+    f = Path(workspace_base) / f".gateway-{port}.json"
+    if not f.is_file():
+        return f"no gateway identity file {f}"
+    try:
+        info = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return f"unreadable gateway identity file {f}"
+    if not isinstance(info, dict) or info.get("service") != "rrsi-eng-gateway":
+        return f"{f} is not an rrsi-eng-gateway identity"
+    if info.get("port") != port:
+        return f"{f} records port {info.get('port')}, not {port}"
+    recorded = info.get("workspace_base")
+    if not isinstance(recorded, str) or not recorded \
+            or Path(recorded).resolve() != Path(workspace_base).resolve():
+        return f"{f} was written for workspace base {recorded}, not {workspace_base}"
+    pid = info.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return f"{f} records no valid pid"
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass                                  # alive, owned by another user
+    except (ProcessLookupError, OverflowError):
+        return f"gateway pid {pid} recorded in {f} is not running"
+    return None
+
+
+def _require_gateway_identity(workspace_base: Path, port: int) -> None:
+    issue = gateway_identity_issue(workspace_base, port)
+    if issue:
+        raise RuntimeError(
+            f"port {port} is in use by a gateway that was not started for workspace root "
+            f"{workspace_base}: {issue}. Stop it (bash domains/eng/scripts/gateway.sh stop) or "
+            f"set GATEWAY_PORT to a free port.")
 
 
 class EngDomain(Domain):
@@ -130,23 +169,50 @@ class EngDomain(Domain):
                 return solid[:n]
         return ids[:n]
 
+    def doctor_checks(self) -> list:
+        needs = (("agent python", AGENT_PY, Path(AGENT_PY).exists() or shutil.which(AGENT_PY),
+                  "set RRSI_AGENT_PYTHON to a Python 3.11 with `pip install -e \".[agentic]\"`"),
+                 ("benchmark root", BENCH_ROOT, BENCH_ROOT.exists(),
+                  "python3 domains/eng/scripts/engdesign/build_engdesign_bench.py --engdesign-open "
+                  "EngDesign/EngDesign-Open --out domains/eng/engdesign_bench   # or set BENCH_ROOT"),
+                 ("grading python", GRADING_PY, GRADING_PY.exists(),
+                  "python3 -m venv domains/eng/.venvs/engdesign && domains/eng/.venvs/engdesign/bin/"
+                  "pip install -r domains/eng/scripts/engdesign/requirements.txt   "
+                  "# or set GRADING_PYTHON"))
+        out = [CheckResult(f"eng {name}", "ok", str(p)) if found
+               else CheckResult(f"eng {name}", "fail", f"{p} not found", fix)
+               for name, p, found, fix in needs]
+        if sys.platform.startswith("linux"):
+            bwrap = shutil.which("bwrap")
+            out.append(CheckResult("bwrap", "ok", bwrap) if bwrap else CheckResult(
+                "bwrap", "fail", "bwrap is not on PATH (code_exec would run unjailed)",
+                "install bubblewrap (e.g. apt install bubblewrap)"))
+        else:
+            out.append(CheckResult(
+                "bwrap", "warn", f"the jailed code_exec needs Linux (bwrap); this is {sys.platform}",
+                "run the eng instance on Linux"))
+        return out
+
     # ---- Evaluate ----------------------------------------------------------
     def _env(self, runs_dir: Path) -> dict:
         return {**os.environ, "RRSI_RUNS_DIR": str(runs_dir),
                 "RRSI_SPLIT_PATH": str(HERE / "data" / "split_engd.json"),
                 "BENCH_ROOT": str(BENCH_ROOT), "GRADING_PYTHON": str(GRADING_PY),
                 "RRSI_HARNESS_MODULE": "harness_eng.main",
-                "WORKSPACE_BASE": str(runs_dir / "workspaces"),
+                "WORKSPACE_BASE": str((runs_dir / "workspaces").resolve()),
                 "GATEWAY_PORT": str(GATEWAY_PORT), "AGENT_PYTHON": AGENT_PY}
 
     def _ensure_gateway(self, root: Path, runs_dir: Path) -> None:
+        ws = (runs_dir / "workspaces").resolve()
         if _port_up(GATEWAY_PORT):
+            _require_gateway_identity(ws, GATEWAY_PORT)
             return
-        (runs_dir / "workspaces").mkdir(parents=True, exist_ok=True)
+        ws.mkdir(parents=True, exist_ok=True)
         subprocess.run(["bash", str(HERE / "scripts" / "gateway.sh"), "start"],
                        env=self._env(runs_dir), cwd=str(HERE))
         for _ in range(40):
             if _port_up(GATEWAY_PORT):
+                _require_gateway_identity(ws, GATEWAY_PORT)
                 return
             time.sleep(1)
         raise RuntimeError("engdesign gateway failed to start (see logs/gateway.log)")

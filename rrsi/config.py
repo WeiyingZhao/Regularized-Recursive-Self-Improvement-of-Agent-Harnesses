@@ -48,9 +48,40 @@ tokens per trial, Delta C is RELATIVE (Eq. tokenbudget), so beta0 = 0.10 means
 
 from __future__ import annotations
 
+import difflib
 import json
+import math
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+VARIANT_LABELS = "ABCDEFGH"     # variant ids A.. ; m <= len(VARIANT_LABELS)
+
+
+class ConfigError(ValueError):
+    """One or more invalid hyperparameters (message: one `<field>: <problem>` per line)."""
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def misspelled_keys(raw: dict) -> list[tuple[str, str]]:
+    """(unknown key, closest core field) for keys that look like typos of a core
+    hyperparameter; other unknown keys are legitimate domain extensions."""
+    core = [f.name for f in fields(RRSIConfig) if f.name != "notes"]
+    out = []
+    for key in raw:
+        if key in core or key == "notes":
+            continue
+        near = difflib.get_close_matches(key, core, n=1, cutoff=0.8)
+        if near:
+            out.append((key, near[0]))
+    return out
 
 
 @dataclass
@@ -73,6 +104,8 @@ class RRSIConfig:
     w_c: float = 15.0
     w_n: float = 0.5
     n_prune: int = 4
+    allow_unknown_cost: bool = False    # research override: admit a candidate whose Delta C
+                                        # is unknown (a side has no token counts) on score alone
     # ---- engineering knobs (not part of the method) ----------------------
     repair_rounds: int = 5          # critic -> proposer repair attempts
     invalid_missing_frac: float = 0.15
@@ -87,11 +120,69 @@ class RRSIConfig:
     @classmethod
     def load(cls, path: Path | str, **overrides) -> "RRSIConfig":
         raw = json.loads(Path(path).read_text())
+        for key, near in misspelled_keys(raw):
+            print(f"[rrsi] warning: unknown config key '{key}' (did you mean "
+                  f"'{near}'?); kept in notes", file=sys.stderr)
         known = {f.name for f in fields(cls)}
         kw = {k: v for k, v in raw.items() if k in known}
         kw["notes"] = {k: v for k, v in raw.items() if k not in known}
         kw.update({k: v for k, v in overrides.items() if v is not None})
-        return cls(**kw)
+        cfg = cls(**kw)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        """Raise one ConfigError listing every invalid field (ranges of the paper's
+        hyperparameters; m is bounded by the variant labels A..H)."""
+        errs: list[str] = []
+
+        def integer(name: str, lo: int, hi: int | None = None) -> bool:
+            v = getattr(self, name)
+            if not _is_int(v):
+                errs.append(f"{name}: must be an integer (got {v!r})")
+            elif v < lo or (hi is not None and v > hi):
+                rng = f">= {lo}" if hi is None else f"between {lo} and {hi}"
+                errs.append(f"{name}: must be {rng} (got {v})")
+            else:
+                return True
+            return False
+
+        def number(name: str, lo: float, hi: float | None = None, strict: bool = False) -> None:
+            v = getattr(self, name)
+            if not _is_num(v):
+                errs.append(f"{name}: must be a finite number (got {v!r})")
+            elif v < lo or (strict and v == lo) or (hi is not None and v > hi):
+                rng = (f"> {lo}" if strict else f">= {lo}") if hi is None else f"between {lo} and {hi}"
+                errs.append(f"{name}: must be {rng} (got {v})")
+
+        integer("T", 1)
+        integer("k", 1)
+        integer("m", 1, len(VARIANT_LABELS))
+        lo_ok, hi_ok = integer("b_min", 1), integer("b_max", 1)
+        if lo_ok and hi_ok and self.b_min > self.b_max:
+            errs.append(f"b_min: must be <= b_max (got {self.b_min} > {self.b_max})")
+        integer("w", 1)
+        if not _is_int(self.m_draft) or self.m_draft < 0 or (_is_int(self.m) and self.m_draft > self.m):
+            errs.append(f"m_draft: must be an integer between 0 and m (got {self.m_draft!r}, "
+                        f"m={self.m!r})")
+        for name in ("n_prune", "eval_parallel"):
+            integer(name, 1)
+        for name in ("repair_rounds", "n_fail_traces", "n_success_traces"):
+            integer(name, 0)
+        if self.delta is not None:
+            number("delta", 0.0)
+        number("delta_z", 0.0, strict=True)
+        for name in ("beta0", "beta1", "w_s", "w_c", "w_n"):
+            number(name, 0.0)
+        number("invalid_missing_frac", 0.0, 1.0)
+        if not isinstance(self.allow_unknown_cost, bool):
+            errs.append(f"allow_unknown_cost: must be true or false (got {self.allow_unknown_cost!r})")
+        for name in ("proposer_model", "analyst_model", "critic_model"):
+            v = getattr(self, name)
+            if not isinstance(v, str) or not v.strip():
+                errs.append(f"{name}: must be a non-empty string (got {v!r})")
+        if errs:
+            raise ConfigError("\n".join(errs))
 
     def dump(self) -> dict:
         return asdict(self)

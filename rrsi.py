@@ -28,10 +28,13 @@
 # limitations under the License.
 """RRSI command line.
 
+  python3 rrsi.py --domain eng doctor [--json]         # offline prerequisite checks (exit 1 on a failure)
+  python3 rrsi.py --domain eng plan [--json]           # offline upper-bound trial and search-role invocation counts
   python3 rrsi.py --domain eng baseline                # evaluate H_0, seed the frontier
   python3 rrsi.py --domain eng calibrate [--jobs base,base2]   # noise band delta
-  python3 rrsi.py --domain eng round --t 3 [--dry-run] # one round (Alg. 1 + Alg. 2)
-  python3 rrsi.py --domain eng run [--start 0]         # driver: rounds until T
+  python3 rrsi.py --domain eng round --t 3 [--dry-run] # one round (Alg. 1 + Alg. 2); --dry-run still calls the analyst (paid)
+  python3 rrsi.py --domain eng run [--start 0]         # driver: rounds until T; always resumes at the earliest
+                                                       # unsettled round, --start beyond it exits 1
   python3 rrsi.py --domain eng readjudicate --t 3      # re-apply Alg. 2 to round 3's stored measurements
   python3 rrsi.py --domain eng reevaluate --t 3        # re-measure round 3's candidates (infra failure), then re-adjudicate
   python3 rrsi.py --domain workspace heldout --label champ [--ref <commit>] [--set heldout]
@@ -41,25 +44,62 @@
 Hyperparameters come from domains/<domain>/rrsi.json; any of them can be
 overridden on the command line (--T, --k, --m, --b-min, --b-max, --w,
 --m-draft, --delta, --beta0, --beta1, --w-s, --w-c, --w-n, --n-prune).
+
+Commands that change run state hold runs/<domain>/.lock; a second concurrent
+writer for the same domain exits naming the holder's pid. `run` takes no lock
+itself (each round it launches does), nor do status, doctor and plan. An
+evaluation whose job name is recorded for a different identity (commit, k, task
+set) exits 1 with one message naming the remedy; the recorded results are kept.
 """
 
 import argparse
 import json
 import sys
+from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from rrsi import gitops as G                 # noqa: E402
-from rrsi.config import RRSIConfig          # noqa: E402
+from rrsi.config import ConfigError, RRSIConfig  # noqa: E402
+from rrsi.doctor import doctor, render       # noqa: E402
 from rrsi.domain import load_domain          # noqa: E402
 from rrsi.driver import drive                # noqa: E402
 from rrsi.loop import Run                    # noqa: E402
+from rrsi.planning import estimate_workload, render_workload, task_counts  # noqa: E402
+from rrsi.provenance import ProvenanceError  # noqa: E402
 from rrsi.schedule import budget_table       # noqa: E402
+from rrsi.state import RunLock               # noqa: E402
 
+# commands that write run state or the evolve branch: one writer per domain at a time
+MUTATING = ("baseline", "calibrate", "round", "readjudicate", "reevaluate", "heldout", "smoke")
 OVERRIDES = ["T", "k", "m", "b_min", "b_max", "w", "m_draft", "delta", "delta_z",
              "beta0", "beta1", "w_s", "w_c", "w_n", "n_prune", "eval_parallel"]
+
+
+def cmd_doctor(domain, cfg, runs: Path, as_json: bool) -> int:
+    """Offline prerequisite checks; exit status 1 if any check failed."""
+    results = doctor(domain, cfg, ROOT, runs)
+    bad = sum(r.status == "fail" for r in results)
+    if as_json:
+        print(json.dumps({"domain": domain.name, "ok": not bad,
+                          "checks": [asdict(r) for r in results]}, indent=1))
+    else:
+        print(render(results))
+        print(f"{len(results)} checks: {sum(r.status == 'ok' for r in results)} ok, "
+              f"{sum(r.status == 'warn' for r in results)} warn, {bad} fail")
+    return 1 if bad else 0
+
+
+def cmd_plan(domain, cfg, as_json: bool) -> None:
+    """Offline upper-bound workload preview (no model call, no run state)."""
+    est = estimate_workload(cfg, *task_counts(domain))
+    if as_json:
+        print(json.dumps({"domain": domain.name, "upper_bound": True, **asdict(est)}, indent=1))
+    else:
+        print(f"domain: {domain.name}\n{render_workload(est)}")
 
 
 def main():
@@ -90,47 +130,67 @@ def main():
     p.add_argument("--set", default="heldout", choices=["heldout", "evolve"])
     sub.add_parser("smoke")
     sub.add_parser("status")
+    for name, help_ in (("doctor", "offline prerequisite checks (exit 1 if any fails)"),
+                        ("plan", "offline upper-bound trial and search-role invocation counts "
+                                 "for a run")):
+        sub.add_parser(name, help=help_).add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     domain = load_domain(args.domain)
-    cfg = RRSIConfig.load(domain.root / "rrsi.json",
-                           **{k: getattr(args, k) for k in OVERRIDES})
+    cfg_path = domain.root / "rrsi.json"
+    try:
+        cfg = RRSIConfig.load(cfg_path, **{k: getattr(args, k) for k in OVERRIDES})
+    except ConfigError as err:
+        if args.cmd != "doctor":
+            sys.exit(f"invalid configuration in {cfg_path}:\n{err}")
+        cfg = err                       # doctor reports it as a failed check
+    if args.cmd == "doctor":            # offline commands dispatch before Run() creates run dirs
+        sys.exit(cmd_doctor(domain, cfg, Path(args.runs), args.json))
+    if args.cmd == "plan":
+        return cmd_plan(domain, cfg, args.json)
     run = Run(domain, cfg, ROOT, Path(args.runs))
+    try:
+        dispatch(run, domain, cfg, args)
+    except ProvenanceError as err:      # a job's recorded identity differs: an operator error
+        sys.exit(f"{args.cmd}: {' '.join(str(err).split())}")
 
-    if args.cmd == "baseline":
-        run.baseline(args.job)
-        run.calibrate([args.job])
-    elif args.cmd == "calibrate":
-        run.calibrate([j.strip() for j in args.jobs.split(",") if j.strip()])
-    elif args.cmd == "round":
-        run.round(args.t, dry_run=args.dry_run)
-    elif args.cmd == "readjudicate":
-        run.readjudicate(args.t)
-    elif args.cmd == "reevaluate":
-        run.reevaluate(args.t, [v for v in args.variants.split(",") if v] or None)
-    elif args.cmd == "run":
-        drive(Path(__file__), args.domain, Path(args.runs), cfg.T, args.start,
-              extra_args=[a for k in OVERRIDES if getattr(args, k) is not None
-                          for a in ("--" + k.replace("_", "-"), str(getattr(args, k)))])
-    elif args.cmd == "heldout":
-        ids = domain.heldout_ids() if args.set == "heldout" else domain.evolve_ids()
-        if not ids:
-            sys.exit(f"domain {domain.name} has no {args.set} split")
-        run.heldout(args.label, ids, ref=args.ref)
-    elif args.cmd == "smoke":
-        run.ensure_branch()
-        wt = run.checkout("smoke", run.branch)
-        ok, detail = domain.smoke(wt, run.runs, "smoke", domain.smoke_ids())
-        print(json.dumps({"ok": ok, **detail}, indent=1))
-        sys.exit(0 if ok else 1)
-    elif args.cmd == "status":
-        fr = run.frontier()
-        print(json.dumps({k: v for k, v in fr.items() if k != "config"}, indent=1))
-        print("b_t schedule:", budget_table(cfg.T, cfg.b_min, cfg.b_max))
-        print(f"delta = {run.delta():.5f}")
-        for r in run.history.render(60):
-            print(json.dumps(r, ensure_ascii=False))
-        print("evolve branch:", G.rev(ROOT, run.branch), "tree", run.harness_tree(run.branch))
+
+def dispatch(run, domain, cfg, args) -> None:
+    with RunLock(run.runs / ".lock") if args.cmd in MUTATING else nullcontext():
+        if args.cmd == "baseline":
+            run.baseline(args.job)
+            run.calibrate([args.job])
+        elif args.cmd == "calibrate":
+            run.calibrate([j.strip() for j in args.jobs.split(",") if j.strip()])
+        elif args.cmd == "round":
+            run.round(args.t, dry_run=args.dry_run)
+        elif args.cmd == "readjudicate":
+            run.readjudicate(args.t)
+        elif args.cmd == "reevaluate":
+            run.reevaluate(args.t, [v for v in args.variants.split(",") if v] or None)
+        elif args.cmd == "run":
+            drive(Path(__file__), args.domain, Path(args.runs), cfg.T, args.start,
+                  extra_args=[a for k in OVERRIDES if getattr(args, k) is not None
+                              for a in ("--" + k.replace("_", "-"), str(getattr(args, k)))])
+        elif args.cmd == "heldout":
+            ids = domain.heldout_ids() if args.set == "heldout" else domain.evolve_ids()
+            if not ids:
+                sys.exit(f"domain {domain.name} has no {args.set} split")
+            run.heldout(args.label, ids, ref=args.ref)
+        elif args.cmd == "smoke":
+            run.ensure_branch()
+            wt = run.checkout("smoke", run.branch)
+            ok, detail = domain.smoke(wt, run.runs, "smoke", domain.smoke_ids())
+            print(json.dumps({"ok": ok, **detail}, indent=1))
+            sys.exit(0 if ok else 1)
+        elif args.cmd == "status":
+            fr = run.frontier()
+            print(json.dumps({k: v for k, v in fr.items() if k != "config"}, indent=1))
+            print("b_t schedule:", budget_table(cfg.T, cfg.b_min, cfg.b_max))
+            print(f"delta = {run.delta():.5f}")
+            for r in run.history.render(60):
+                print(json.dumps(r, ensure_ascii=False))
+            print("evolve branch:", G.rev(ROOT, run.branch), "tree", run.harness_tree(run.branch))
 
 
 if __name__ == "__main__":

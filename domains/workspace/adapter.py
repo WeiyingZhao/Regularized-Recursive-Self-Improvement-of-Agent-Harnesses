@@ -47,12 +47,11 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent.parent))
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent.parent))  # the repo root only: siblings are `domains.<name>.*`
+from rrsi.doctor import CheckResult    # noqa: E402
 from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
-import briefs                            # noqa: E402
-import render                            # noqa: E402
+from domains.workspace import briefs, render  # noqa: E402
 
 CFG = json.loads((HERE / "rrsi.json").read_text())
 HARVEY_LAB_ROOT = Path(os.environ.get("HARVEY_LAB_ROOT", CFG.get("harvey_lab_root") or "harvey-labs"))
@@ -67,7 +66,7 @@ def split() -> dict:
     global _SPLIT
     if _SPLIT is None:
         if not SPLIT_PATH.exists():
-            import split_workspace                       # noqa: WPS433
+            from domains.workspace import split_workspace  # noqa: WPS433
             split_workspace.write_split(str(SPLIT_PATH), str(HARVEY_LAB_ROOT))
         _SPLIT = json.loads(SPLIT_PATH.read_text())
     return _SPLIT
@@ -127,6 +126,13 @@ class WorkspaceDomain(Domain):
 
     def regression_threshold(self, k: int) -> float:
         return 0.05
+
+    def doctor_checks(self) -> list:
+        if HARVEY_LAB_ROOT.exists():
+            return [CheckResult("harvey lab", "ok", str(HARVEY_LAB_ROOT))]
+        return [CheckResult("harvey lab", "fail", f"{HARVEY_LAB_ROOT} not found",
+                            "git clone https://github.com/harveyai/harvey-labs.git and set "
+                            "HARVEY_LAB_ROOT (pinned commit: harvey_lab_commit in rrsi.json)")]
 
     def _n_criteria(self, task_id: str) -> int:
         if task_id not in self._criteria_count:
