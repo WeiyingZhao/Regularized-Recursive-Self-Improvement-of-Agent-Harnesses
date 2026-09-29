@@ -39,7 +39,9 @@ For every screened candidate H' with measurement (S', C'):
 
 Delta C is unknown when either side has no token counts; such a candidate is not
 admissible (cost evidence incomplete) unless cfg.allow_unknown_cost, which runs the
-rule with Delta C = 0 but still records Delta C as unknown.
+rule with Delta C = 0 but still records Delta C as unknown. A candidate whose C'
+averages only part of its trial slots is judged on that partial mean; the decision
+records its token_coverage (no coverage threshold is applied yet).
 """
 
 from __future__ import annotations
@@ -77,6 +79,7 @@ class Decision:
     delta_C: float | None = None
     novelty: int = 0
     guards: list = field(default_factory=list)
+    token_coverage: float | None = None   # share of the candidate's trial slots C' averages
 
     def to_json(self) -> dict:
         return self.__dict__
@@ -107,7 +110,7 @@ def judge(cand: Candidate, incumbent: EvalResult, S_star: float, delta: float,
     dC = relative_cost_change(ev.C, incumbent.C)
     nov = novelty(cand.components, incumbent_counts)
     d = Decision(cand.variant, False, "", S=ev.S, C=ev.C, delta_S=dS, delta_C=dC,
-                 novelty=nov, guards=list(guards or []))
+                 novelty=nov, guards=list(guards or []), token_coverage=ev.token_coverage)
     floor = S_star - delta
     if ev.S < floor:
         d.reason = (f"below noise-adjusted floor: S' {ev.S:.4f} < S* {S_star:.4f} "

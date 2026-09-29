@@ -34,8 +34,8 @@ from fake_domain import make_run  # noqa: E402
 from rrsi.config import ConfigError, RRSIConfig  # noqa: E402
 from rrsi.evaluate import (EvalResult, EvaluationError, TaskResult, aggregate,  # noqa: E402
                            evaluate, relative_cost_change)
-from rrsi.loop import _fmt_dc  # noqa: E402
-from rrsi.selection import Candidate, select_round  # noqa: E402
+from rrsi.loop import _fmt_cov, _fmt_dc  # noqa: E402
+from rrsi.selection import Candidate, Decision, select_round  # noqa: E402
 
 
 def T(rewards, **kw) -> TaskResult:
@@ -329,6 +329,27 @@ def test_a_gate_failure_still_has_no_cost():
     assert win is None and decs[0].reason == "critic_reject" and decs[0].delta_C is None
 
 
+def test_partial_token_coverage_is_admitted_and_disclosed_in_the_decision():
+    """No coverage threshold yet (a method decision left open): a candidate whose C
+    averages half its trial slots is admitted, and the decision says so."""
+    inc = _ev("inc", 0.5, 1000.0)
+    half = aggregate("A", 2, {f"t{i}": TaskResult([0.7, 0.7], tokens=[900, None])
+                              for i in range(10)})
+    win, decs = select_round([_cand("A", half)], inc, 0.5, 0.05, _cfg(), {})
+    d = decs[0]
+    assert win is not None and d.admissible and d.token_coverage == 0.5
+    assert json.loads(json.dumps(d.to_json()))["token_coverage"] == 0.5
+    _, decs = select_round([Candidate("D", [], gate_failure="critic_reject")], inc, 0.5,
+                           0.05, _cfg(), {})
+    assert decs[0].token_coverage is None                      # nothing measured
+    old = {k: v for k, v in d.to_json().items() if k != "token_coverage"}
+    assert Decision(**old).token_coverage is None               # older decisions.json rows
+
+
+def test_log_formatting_of_token_coverage():
+    assert _fmt_cov(None) == "n/a" and _fmt_cov(1.0) == "1.00" and _fmt_cov(0.456) == "0.46"
+
+
 # ---- config ----------------------------------------------------------------------------
 
 def test_allow_unknown_cost_config_field():
@@ -354,6 +375,25 @@ def test_allow_unknown_cost_loads_from_json(tmp_path):
 def test_log_formatting_of_an_unknown_cost_change():
     assert _fmt_dc(None) == "n/a"
     assert _fmt_dc(0.1234) == "+0.123" and _fmt_dc(-0.5) == "-0.500"
+
+
+def test_round_records_and_logs_token_coverage(tmp_path, monkeypatch, capsys):
+    fx = make_run(tmp_path, monkeypatch)
+    fx.run.baseline()
+    fx.run.round(0)
+    out = capsys.readouterr().out
+    decs = json.loads((fx.run.runs / "r0" / "decisions.json").read_text())
+    assert [d["token_coverage"] for d in decs] == [1.0, 1.0]
+    assert out.count("cov=1.00") == 2
+
+
+def test_no_success_traces_selects_only_the_failures(tmp_path, monkeypatch):
+    fx = make_run(tmp_path, monkeypatch, n_fail_traces=1, n_success_traces=0)
+    fx.run.baseline()
+    per_task = fx.run.incumbent_eval(fx.run.frontier()).per_task
+    assert len(fx.run.build_traces("base", per_task)) == 1
+    fx.cfg.n_success_traces = 1
+    assert len(fx.run.build_traces("base", per_task)) == 2
 
 
 def _round_without_token_counts(tmp_path, monkeypatch, capsys, **cfg):

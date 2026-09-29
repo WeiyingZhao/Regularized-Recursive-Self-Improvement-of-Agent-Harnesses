@@ -304,6 +304,9 @@ def test_cached_candidate_eval_with_mismatched_provenance_is_refused(played):
         fx.run._evaluate(0, c, fx.rdir, fx.ids)
     assert str(ep) in str(e.value) and "k: recorded 9 != expected 2" in str(e.value)
     assert ep.read_bytes() == before and fx.domain.n_runs == calls and c.ev is None
+    msg = str(e.value)                              # name all three artifacts, moved together
+    assert str(manifest_path(fx.run.runs, "r0A")) in msg and str(fx.run.jobs / "r0A") in msg
+    assert "together" in msg and "only some" in msg and "Remove it deliberately" not in msg
 
 
 def test_cached_candidate_eval_for_another_commit_is_refused(played):
