@@ -57,15 +57,13 @@ from . import gitops as G
 from .analyst import analyze, load_digests
 from .calibrate import calibrate as _calibrate, write as _write_cal
 from .components import normalize
-from .config import RRSIConfig
+from .config import VARIANT_LABELS, RRSIConfig
 from .critic import review
 from .evaluate import EvalResult, evaluate
 from .history import History, exploration, stall_flag
 from .propose import propose
 from .schedule import edit_budget
 from .selection import Candidate, select_round
-
-VARIANT_LABELS = "ABCDEFGH"
 
 
 def log(domain: str, msg: str) -> None:

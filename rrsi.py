@@ -52,7 +52,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from rrsi import gitops as G                 # noqa: E402
-from rrsi.config import RRSIConfig          # noqa: E402
+from rrsi.config import ConfigError, RRSIConfig  # noqa: E402
 from rrsi.domain import load_domain          # noqa: E402
 from rrsi.driver import drive                # noqa: E402
 from rrsi.loop import Run                    # noqa: E402
@@ -93,8 +93,11 @@ def main():
     args = ap.parse_args()
 
     domain = load_domain(args.domain)
-    cfg = RRSIConfig.load(domain.root / "rrsi.json",
-                           **{k: getattr(args, k) for k in OVERRIDES})
+    cfg_path = domain.root / "rrsi.json"
+    try:
+        cfg = RRSIConfig.load(cfg_path, **{k: getattr(args, k) for k in OVERRIDES})
+    except ConfigError as err:
+        sys.exit(f"invalid configuration in {cfg_path}:\n{err}")
     run = Run(domain, cfg, ROOT, Path(args.runs))
 
     if args.cmd == "baseline":
