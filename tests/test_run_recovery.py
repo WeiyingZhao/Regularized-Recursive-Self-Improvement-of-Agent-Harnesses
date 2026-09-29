@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_domain import ROOT, git, make_run  # noqa: E402
 
 from rrsi import gitops as G  # noqa: E402
+from rrsi.evaluate import EvalResult  # noqa: E402
 from rrsi.history import History  # noqa: E402
 from rrsi.loop import Run  # noqa: E402
 from rrsi.state import RunLock  # noqa: E402
@@ -307,6 +308,108 @@ def test_reevaluate_with_a_later_round_keeps_every_evaluation(fx):
             op(0)
     assert all((fx.run.runs / "r0" / v / "eval.json").exists() for v in "AB")
     assert snapshot(fx) == before and tip(fx) == ref and fx.domain.n_runs == runs
+
+
+@pytest.mark.parametrize("started", ["crashed", "dry_run"])
+def test_revision_is_refused_once_the_next_round_has_started(fx, monkeypatch, started):
+    """Round 1 was drafted from H_1 and not settled. Revising round 0 now would let the
+    resumed round 1 promote a change drafted from an H_1 that is no longer the incumbent."""
+    fx.run.round(0)
+    if started == "crashed":                 # drafted and evaluated, crashed before settling
+        crash_once(monkeypatch, Run, "_settle")
+        with pytest.raises(Crash):
+            fx.run.round(1)
+    else:
+        fx.run.round(1, dry_run=True)
+    assert (fx.run.runs / "r1").is_dir() and len(fx.run.frontier()["trajectory"]) == 2
+    delta, w_s = fx.cfg.delta, fx.cfg.w_s
+    fx.cfg.delta, fx.cfg.w_s = 0.5, 0.0      # a revision that would reject r0B
+    before, rs, runs = snapshot(fx), refs(fx), fx.domain.n_runs
+    for op in (fx.fresh().readjudicate, fx.fresh().reevaluate):
+        with pytest.raises(SystemExit) as e:
+            op(0)
+        msg = str(e.value)
+        assert "round 1 has started" in msg and str(fx.run.runs / "r1") in msg
+        assert "fake/r1" in msg and "jobs/r1" in msg and "manifests/r1" in msg
+        assert "round --t 1" in msg and "Nothing was changed" in msg
+    assert snapshot(fx) == before and refs(fx) == rs and fx.domain.n_runs == runs
+    fx.cfg.delta, fx.cfg.w_s = delta, w_s
+    fx.fresh().round(1)                      # round 1 resumes from the H_1 it was drafted from
+    assert [x["t"] for x in fx.run.frontier()["trajectory"]] == [0, 1, 2]
+
+
+def test_revision_of_an_unsettled_round_is_refused(fx, monkeypatch):
+    crash_once(monkeypatch, Run, "_settle")
+    with pytest.raises(Crash):
+        fx.run.round(0)
+    before, rs, runs = snapshot(fx), refs(fx), fx.domain.n_runs
+    for op in (fx.fresh().readjudicate, fx.fresh().reevaluate):
+        with pytest.raises(SystemExit, match=r"round 0 is not settled.*`round --t 0`"):
+            op(0)
+    assert snapshot(fx) == before and refs(fx) == rs and fx.domain.n_runs == runs
+
+
+def test_reevaluate_refuses_a_changed_evaluation_identity_before_touching_anything(fx):
+    fx.run.round(0)
+    fx.cfg.k = 3
+    before, rs, runs = snapshot(fx), refs(fx), fx.domain.n_runs
+    for variants in (["B"], None):
+        with pytest.raises(SystemExit) as e:
+            fx.fresh().reevaluate(0, variants)
+        msg = str(e.value)
+        assert "k: recorded 2 != expected 3" in msg and "Nothing was changed" in msg
+        assert "manifests/r0" in msg and "jobs/r0" in msg and "together" in msg
+    assert snapshot(fx) == before and refs(fx) == rs and fx.domain.n_runs == runs
+    assert not any((fx.run.wt_root / f"r0{v}").exists() for v in "AB")
+    # the cached eval.json is checked too, even when the manifest agrees
+    fx.cfg.k = 2
+    ep = fx.run.runs / "r0" / "A" / "eval.json"
+    d = json.loads(ep.read_text())
+    d["provenance"]["k"] = 9
+    ep.write_text(json.dumps(d))
+    before = snapshot(fx)
+    with pytest.raises(SystemExit, match=rf"{ep}.*k: recorded 9 != expected 2"):
+        fx.fresh().reevaluate(0, ["A"])
+    assert snapshot(fx) == before and refs(fx) == rs and fx.domain.n_runs == runs
+
+
+def test_reevaluate_with_the_evaluator_still_broken_keeps_the_evidence(fx):
+    fx.run.round(0)
+    fx.domain.all_missing = True
+    before, rs = snapshot(fx), refs(fx)
+    with pytest.raises(SystemExit) as e:
+        fx.fresh().reevaluate(0)
+    assert isinstance(e.value.code, str)                                # exit status 1
+    assert "not re-adjudicated" in e.value.code and "kept" in e.value.code
+    assert snapshot(fx) == before and refs(fx) == rs                    # evals, frontier, history
+    assert not any((fx.run.wt_root / f"r0{v}").exists() for v in "AB")
+
+
+def test_reevaluate_replaces_valid_re_measurements_and_re_adjudicates(fx, capsys):
+    rdir = fx.run.runs / "r0"
+    fx.domain.missing_jobs = {"r0B"}
+    fx.run.round(0)
+    assert fx.run.frontier()["incumbent"]["variant"] == "A"
+    assert not (rdir / "B" / "eval.json").exists()
+    fx.domain.missing_jobs = set()                  # the infrastructure works again
+    fx.fresh().reevaluate(0, ["B"])
+    fr, st = fx.run.frontier(), settlement(fx)
+    assert (st["kind"], st["phase"]) == ("readjudicate", "done")
+    assert fr["incumbent"]["variant"] == "B" and tip(fx) == G.full_rev(fx.repo, "fake/r0B")
+    assert EvalResult.load(rdir / "B" / "eval.json").S == pytest.approx(0.6)
+    assert {r["variant"]: r["outcome"] for r in records(fx, 0)} == {"A": "LOST", "B": "ACCEPTED"}
+    # a valid re-measurement replaces its eval.json; an invalid one keeps the earlier file
+    a_before = (rdir / "A" / "eval.json").read_bytes()
+    fx.domain.tokens, fx.domain.missing_jobs = 80, {"r0A"}
+    capsys.readouterr()
+    fx.fresh().reevaluate(0)
+    out = capsys.readouterr().out
+    assert (rdir / "A" / "eval.json").read_bytes() == a_before
+    assert "r0A" in out and "previous eval.json is kept" in out
+    assert EvalResult.load(rdir / "B" / "eval.json").C == 80
+    assert EvalResult.load(fx.run.eval_path("r0B")).C == 80
+    assert fx.run.frontier()["incumbent"]["C"] == 80
+    assert not any((fx.run.wt_root / f"r0{v}").exists() for v in "AB")
 
 
 def test_round_with_every_candidate_invalid_is_not_settled(fx):

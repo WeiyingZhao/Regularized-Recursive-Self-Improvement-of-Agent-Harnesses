@@ -50,7 +50,8 @@ reaches history before its settlement record, and a settlement interrupted
 anywhere after that record is finished by `recover()` before round / baseline /
 readjudicate / reevaluate do anything else. A settled round is never re-run; a
 round whose every screened candidate failed evaluation for infrastructure
-reasons is not settled at all.
+reasons is not settled at all. Only the most recently settled round can be
+revised (readjudicate / reevaluate), and only before the next one has started.
 """
 
 from __future__ import annotations
@@ -70,7 +71,8 @@ from .critic import review
 from .evaluate import EvalResult, evaluate
 from .history import History, exploration, stall_flag
 from .propose import propose
-from .provenance import ProvenanceError, fingerprint, mismatches, move_aside, read_manifest
+from .provenance import (ProvenanceError, fingerprint, manifest_path, mismatches, move_aside,
+                         read_manifest)
 from .schedule import edit_budget
 from .selection import Candidate, select_round
 from .state import atomic_write_json, atomic_write_text
@@ -383,8 +385,8 @@ class Run:
         if n > t + 1:
             raise SystemExit(f"round {t} is already settled (frontier trajectory reaches "
                              f"t={n - 1}); nothing was changed. To revise it use "
-                             f"`readjudicate --t {t}` or `reevaluate --t {t}` (only while no "
-                             f"later round exists)")
+                             f"`readjudicate --t {t}` or `reevaluate --t {t}` (only while it is "
+                             f"the most recently settled round and round {t + 1} has not started)")
         if n < t + 1:
             raise SystemExit(f"round {t} needs trajectory up to t={t}; have "
                              f"{n} entries (run earlier rounds)")
@@ -509,8 +511,9 @@ class Run:
         """Re-run Algorithm 2 on the STORED measurements of round t, after a
         change of delta or of the acceptance weights. No new evaluation is
         spent: every candidate keeps the (S', C') it was measured at against
-        the incumbent H_t it was drafted from. Rounds after t must have been
-        removed first, since their candidates were drafted from the old H_{t+1}."""
+        the incumbent H_t it was drafted from. Only the most recently settled round,
+        and only before round t+1 has started (_adjudicable), since a later round is
+        drafted from the H_{t+1} being revised."""
         d, cfg = self.domain, self.cfg
         self.recover()
         fr = self.frontier()
@@ -576,14 +579,18 @@ class Run:
             log(d.name, f"re-adjudicated r{t}: no admissible candidate; H_{t+1} = H_{t}")
 
     def reevaluate(self, t: int, variants: list[str] | None = None) -> None:
-        """Re-measure the stored (committed) candidates of round t whose evaluation
-        was invalid or corrupted by an infrastructure failure, then re-adjudicate
-        the round. Rounds after t must have been removed first; that and the other
-        readjudicate preconditions are checked before any eval.json is touched."""
+        """Re-measure the stored (committed) candidates of round t after an
+        infrastructure failure, then re-adjudicate the round. Everything is checked
+        before anything is run or written: the readjudicate preconditions, and that
+        each selected candidate's evaluation identity (commit, harness tree, k, tasks)
+        still matches its manifest and its cached eval.json. A valid re-measurement
+        replaces eval.json; an invalid one keeps the previous file; if none is valid,
+        the round is not re-adjudicated (SystemExit)."""
         d = self.domain
         self.recover()
         rdir, _, _ = self._adjudicable(self.frontier(), t)
         ids = d.evolve_ids()
+        todo = []                        # (candidate, fingerprint) re-measured below
         for vdir in sorted(p for p in rdir.iterdir() if p.is_dir() and len(p.name) == 1):
             if variants and vdir.name not in variants:
                 continue
@@ -592,32 +599,86 @@ class Run:
             if not prep.get("commit") or not G.branch_exists(self.repo, prep.get("branch", "")):
                 log(d.name, f"r{t}{vdir.name}: no committed candidate to re-evaluate")
                 continue
-            (vdir / "eval.json").unlink(missing_ok=True)
-            wt = self.wt_root / f"r{t}{vdir.name}"
-            G.worktree_remove(self.repo, wt)
-            G.git(self.repo, "worktree", "add", str(wt), prep["branch"], check=True)
-            c = Candidate(vdir.name, prep.get("edits") or [], diff_path=prep.get("diff_path"),
-                          branch=prep["branch"], commit=prep["commit"])
-            self._evaluate(t, c, rdir, ids)
-            log(d.name, f"r{t}{vdir.name}: re-evaluated -> "
-                + (f"S={c.ev.S:.4f} C={c.ev.C} missing={c.ev.missing}" if c.ev else
-                   f"{c.gate_failure}: {c.detail}"))
-            G.worktree_remove(self.repo, wt)
+            job, ep = f"r{t}{vdir.name}", vdir / "eval.json"
+            try:
+                fp = self.fingerprint(prep["commit"], ids)
+                recorded = [(manifest_path(self.runs, job), read_manifest(self.runs, job))]
+            except ProvenanceError as e:
+                raise SystemExit(f"reevaluate r{t}: {e}. Nothing was changed") from None
+            if ep.exists():
+                recorded.append((ep, EvalResult.load(ep).provenance))
+            for src, prov in recorded:
+                bad = mismatches(fp, prov) if prov is not None else []
+                if bad:
+                    raise SystemExit(
+                        f"reevaluate r{t}: {src} was recorded for a different evaluation than "
+                        f"re-measuring {job} now requires ({'; '.join(bad)}). Nothing was "
+                        f"changed. " + move_aside(self.runs, job, ep))
+            todo.append((Candidate(vdir.name, prep.get("edits") or [],
+                                   diff_path=prep.get("diff_path"), branch=prep["branch"],
+                                   commit=prep["commit"]), fp))
+        if not todo:
+            raise SystemExit(f"reevaluate r{t}: no committed candidate "
+                             f"{'among ' + ','.join(variants) + ' ' if variants else ''}"
+                             f"to re-measure; nothing was changed")
+        valid = []
+        for c, fp in todo:
+            job, ep = f"r{t}{c.variant}", rdir / c.variant / "eval.json"
+            wt = self.wt_root / job
+            try:
+                G.worktree_remove(self.repo, wt)
+                G.git(self.repo, "worktree", "add", str(wt), c.branch, check=True)
+                ev = self._measure(t, c, ids, fp)
+            finally:
+                G.worktree_remove(self.repo, wt)
+            if ev is None:
+                log(d.name, f"r{t}{c.variant}: re-measurement invalid ({c.gate_failure}: "
+                    f"{c.detail}); " + ("the previous eval.json is kept" if ep.exists()
+                                        else "it has no eval.json"))
+                continue
+            ev.save(ep)
+            ev.save(self.eval_path(job))
+            valid.append(c.variant)
+            log(d.name, f"r{t}{c.variant}: re-evaluated -> S={ev.S:.4f} C={ev.C} "
+                f"missing={ev.missing}")
+        if not valid:
+            raise SystemExit(f"reevaluate r{t}: every re-measured candidate "
+                             f"({', '.join(c.variant for c, _ in todo)}) failed evaluation "
+                             f"again (infrastructure); the previous evaluations are kept and "
+                             f"round {t} was not re-adjudicated. Re-run once the evaluator works")
         self.readjudicate(t)
 
     # ------------------------------------------------------------ helpers --
     def _adjudicable(self, fr: dict, t: int) -> tuple[Path, dict, str]:
         """Preconditions of readjudicate / reevaluate, checked before anything is
-        deleted, re-measured or written: no later round was drafted from the
-        H_{t+1} being revised, H_t and its evaluation exist, round t was drafted,
-        and a noise band is available. -> (round dir, trajectory[t], H_t's job)."""
+        re-measured or written: round t is the most recently settled round and round
+        t+1 has not started (no r<t+1>/), since a later round is drafted from the
+        H_{t+1} being revised; H_t and its evaluation exist, round t was drafted, and
+        a noise band is available. -> (round dir, trajectory[t], H_t's job)."""
         n = len(fr["trajectory"])
         if n > t + 2:
             raise SystemExit(f"rounds after {t} exist in the frontier (trajectory reaches "
-                             f"t={n - 1}); remove them first. Nothing was changed")
+                             f"t={n - 1}); readjudicate and reevaluate apply only to the most "
+                             f"recently settled round. Nothing was changed")
         if n < t + 1:
             raise SystemExit(f"round {t} has no incumbent H_{t} in the frontier "
                              f"({n} trajectory entries)")
+        if n == t + 1:
+            raise SystemExit(f"round {t} is not settled (frontier trajectory reaches t={t}); "
+                             f"readjudicate and reevaluate revise a settled round only. An "
+                             f"unsettled round is resumed by re-running `round --t {t}`. "
+                             f"Nothing was changed")
+        nxt, u = self.runs / f"r{t + 1}", t + 1
+        if nxt.exists():
+            v = f"[{VARIANT_LABELS[0]}-{VARIANT_LABELS[-1]}]"
+            raise SystemExit(
+                f"round {u} has started ({nxt} exists) from the H_{u} that round {t} settled, "
+                f"so round {t} can no longer be revised. Nothing was changed. An unsettled "
+                f"round is resumed by re-running `round --t {u}`, not readjudicated. To revise "
+                f"round {t} instead, first move aside everything round {u} wrote: {nxt}/, the "
+                f"branches {self.domain.name}/r{u}{v}* with their worktrees "
+                f"{self.wt_root}/r{u}{v}*, {self.jobs}/r{u}{v}* and "
+                f"{self.runs / 'manifests'}/r{u}{v}*.json")
         inc_entry = fr["trajectory"][t]
         inc_job = inc_entry.get("job") or ("base" if t == 0 else None)
         if not inc_job or not self.eval_path(inc_job).exists():
@@ -770,7 +831,10 @@ class Run:
                          branch=branch, commit=commit)
 
     def _evaluate(self, t: int, c: Candidate, rdir: Path, ids: list[str]) -> None:
-        d, cfg = self.domain, self.cfg
+        """c.ev <- the candidate's cached eval.json when its identity matches (a
+        mismatch is a SystemExit, the file kept), else a fresh valid measurement
+        (_measure), saved; an invalid one leaves c.gate_failure set."""
+        d = self.domain
         job = f"r{t}{c.variant}"
         ep = rdir / c.variant / "eval.json"
         fp = self.fingerprint(c.commit, ids)
@@ -788,25 +852,33 @@ class Run:
                 log(d.name, f"{c.variant}: reusing eval.json")
             c.ev = cached
             return
-        wt = self.wt_root / job
+        ev = self._measure(t, c, ids, fp)
+        if ev is not None:
+            ev.save(ep)
+            ev.save(self.eval_path(job))
+            c.ev = ev
+
+    def _measure(self, t: int, c: Candidate, ids: list[str], fp: dict) -> EvalResult | None:
+        """Evaluate(H', D_evolve, k) of candidate c in its worktree wt/r<t><v> under
+        identity `fp`, retried once when too many trials are missing. Saves nothing.
+        -> the valid result, or None with c.gate_failure / c.detail set."""
+        d, cfg = self.domain, self.cfg
+        job = f"r{t}{c.variant}"
         ev = None
         for attempt in range(2):
             try:
-                ev = evaluate(d, wt, self.runs, job, ids, cfg.k, log_prefix=job, provenance=fp)
+                ev = evaluate(d, self.wt_root / job, self.runs, job, ids, cfg.k, log_prefix=job,
+                              provenance=fp)
             except ProvenanceError:
                 raise                    # an operator error (a job name reused), not infrastructure
             except Exception as e:  # noqa: BLE001
                 c.gate_failure, c.detail = "eval_invalid", f"evaluation crashed: {e!r}"[:600]
                 log(d.name, f"{c.variant}: {c.detail}")
-                return
+                return None
             if ev.missing <= cfg.invalid_missing_frac * ev.n_expected:
-                break
+                return ev
             log(d.name, f"{c.variant}: {ev.missing}/{ev.n_expected} trials missing "
                 f"(infrastructure){'; retrying once' if attempt == 0 else ''}")
-        if ev.missing > cfg.invalid_missing_frac * ev.n_expected:
-            c.gate_failure = "eval_invalid"
-            c.detail = f"{ev.missing}/{ev.n_expected} trials missing (infrastructure) after a retry"
-            return
-        ev.save(ep)
-        ev.save(self.eval_path(job))
-        c.ev = ev
+        c.gate_failure = "eval_invalid"
+        c.detail = f"{ev.missing}/{ev.n_expected} trials missing (infrastructure) after a retry"
+        return None
