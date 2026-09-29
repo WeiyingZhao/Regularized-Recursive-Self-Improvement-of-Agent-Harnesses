@@ -8,7 +8,7 @@
 ## Setup
 
 * Docker. The harness drives each task's container through a tmux session; `bin/docker` wraps `sudo -E docker`, edit it if your user is in the `docker` group.
-* harbor: `python3 -m venv domains/coding/.venv && domains/coding/.venv/bin/pip install "harbor>=0.18"` (or point `RRSI_CODING_PYTHON` / `RRSI_CODING_VENV` at an existing environment). harbor pulls `terminal-bench/terminal-bench-2-1` and `swe-bench/swe-bench-verified` from its registry on first use.
+* harbor: `python3 -m venv domains/coding/.venv && domains/coding/.venv/bin/pip install "harbor>=0.18"` (or point `RRSI_CODING_VENV` at an existing environment that provides `bin/harbor`; `smoke` and evaluation both use it, and `RRSI_CODING_PYTHON` overrides only the interpreter for `smoke`'s compile and constructor checks, defaulting to `$RRSI_CODING_VENV/bin/python`). harbor pulls `terminal-bench/terminal-bench-2-1` and `swe-bench/swe-bench-verified` from its registry on first use.
 * `VERTEXAI_PROJECT` / `VERTEXAI_LOCATION` for the policy model (`policy_model` in `rrsi.json`, a LiteLLM model string).
 
 ## Run

@@ -23,12 +23,14 @@ The builder writes `engdesign_bench/benchmarks/<domain>/<task>/`: the full upstr
 ## Run
 
 ```bash
-GATEWAY_PORT=8996 bash scripts/gateway.sh start   # the frozen MCP tool gateway: file tools, read_pdf, jailed code_exec
+bash scripts/gateway.sh start                      # the frozen MCP tool gateway on port 8996: file tools, read_pdf, jailed code_exec
 bash scripts/preflight.sh                          # tree, venvs, host tools, jail escape probes
 python3 rrsi.py --domain eng smoke
 python3 rrsi.py --domain eng baseline              # 61 tasks x k=4 = 244 trials
 python3 rrsi.py --domain eng run                   # T=40 rounds
 ```
+
+The gateway (and the adapter's own auto-start) uses port 8996 and workspace root `runs/eng/workspaces`, the defaults for `--runs runs`; override the port with `GATEWAY_PORT`. When you start it by hand for another `--runs` directory, set `WORKSPACE_BASE=<runs>/workspaces` to match, because tasks write their workspaces under the adapter's `--runs` and the gateway only serves paths inside its `WORKSPACE_BASE`. `gateway.sh start` records the port owner in `$WORKSPACE_BASE/.gateway-<port>.json`; it refuses a port already served by anything else, and so does the adapter (stop the other service or set `GATEWAY_PORT` to a free port).
 
 Each trial writes `runs/eng/jobs/<job>/<task>/t<k>/payload.py` (the graded deliverable, a literal `PAYLOAD` dict), `traj.json`, `meta.json` and, after `bench/verify.py`, `verdict.json` with `combined_score`, `passed` and `valid`.
 
