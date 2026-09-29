@@ -53,8 +53,6 @@ components that stop helping are pruned.
 | Noise band delta | fixed per instance in `rrsi.json` (0.017 / 0.004 / 0.020); `rrsi/calibrate.py` re-estimates it when `delta` is `null` (bootstrap over trials of the base evaluation, or repeated base evaluations) |
 | Non-compensatory domain criteria | `Domain.guards` (engineering: valid-rate drop, no-submission rise) |
 
-**Cost evidence.** A task with fewer than k trials counts the shortfall as missing trials, and malformed rewards, weights or task sets fail the evaluation (`EvaluationError`). If either the candidate or the incumbent has no positive token count, Delta C is unknown and the candidate is not admissible (`cost evidence incomplete`); earlier versions treated unknown as 0. Set `"allow_unknown_cost": true` in `rrsi.json` to admit such candidates on score alone (research override; the decision still records Delta C as unknown). `eval.json` now carries `token_coverage`, the share of trial slots that C is averaged over.
-
 ---
 
 ## ⚡️ Quickstart
@@ -87,11 +85,11 @@ Every instance follows the same shape:
 ```bash
 python3 rrsi.py --domain <coding|workspace|eng> smoke     # liveness: compile, construct, a couple of tasks
 python3 rrsi.py --domain <name> baseline                   # Evaluate(H_0), seed runs/<name>/frontier.json
-python3 rrsi.py --domain <name> run                        # rounds 0..T-1, resumable; touch runs/<name>/STOP to stop
+python3 rrsi.py --domain <name> run                        # rounds 0..T-1; resumes at the earliest unsettled round; touch runs/<name>/STOP to stop
 python3 rrsi.py --domain <name> status
 ```
 
-Each round drafts two candidates in their own git worktrees, screens them, evaluates both on the full evolve set and fast-forwards `evolve/<name>` to the winner. `runs/<name>/` holds the frontier, the edit history and the raw trials. Hyperparameters live in `domains/<name>/rrsi.json` and can be overridden on the command line (`--T`, `--k`, `--delta`, `--beta1`, ...); `readjudicate --t <t>` re-applies Algorithm 2 to a stored round and `reevaluate --t <t>` re-measures one after an infrastructure failure.
+Each round drafts two candidates in their own git worktrees, screens them, evaluates both on the full evolve set and fast-forwards `evolve/<name>` to the winner. `runs/<name>/` holds the frontier, the edit history and the raw trials. Hyperparameters live in `domains/<name>/rrsi.json` and can be overridden on the command line (`--T`, `--k`, `--delta`, `--beta1`, ...); `readjudicate --t <t>` re-applies Algorithm 2 to a stored round and `reevaluate --t <t>` re-measures one after an infrastructure failure. `run` always resumes from the earliest unsettled round; `--start N` cannot skip one and exits 1 if `N` is beyond it. See [Operator journey](#operator-journey) for the order to run things in and for recovery and evidence rules.
 
 Please refer to the specific document for the instance you want to run for its environment, its evaluation protocol and the out-of-distribution runs:
 
@@ -122,20 +120,37 @@ python3 rrsi.py --domain eng baseline && python3 rrsi.py --domain eng run
 bash domains/eng/scripts/final_eval.sh frontier               # Frontier-Eng, from a Frontier-Engineering checkout
 ```
 
-### Check setup and preview workload
+### Operator journey
 
-Two offline commands make no model call, need no credentials, and create no `runs/` directories:
+Start a new experiment in this order. The first two steps make no model call, need no credentials and create no `runs/` directories.
 
 ```bash
-python3 rrsi.py --domain <name> doctor [--json]   # prerequisites; exits 1 if any check fails
-python3 rrsi.py --domain <name> plan [--json]     # upper-bound trial and search-call counts
+python3 rrsi.py --domain <name> doctor [--json]   # 1. prerequisites; exits 1 if any check fails
+python3 rrsi.py --domain <name> plan [--json]     # 2. upper-bound workload for the configured T, k and m
+python3 rrsi.py --domain <name> smoke             # 3. liveness of the starting harness (runs a couple of tasks)
+python3 rrsi.py --domain <name> baseline          # 4. Evaluate(H_0), calibrate delta, seed the frontier
+python3 rrsi.py --domain <name> run               # 5. rounds until T (does step 4 first if it is missing)
 ```
 
-`doctor` checks Python, the `anthropic` package (found, not imported), that `RRSI_VERTEX_PROJECTS` is set (only the project count is shown), git, the configuration, the runs directory, the domain's files and task set, and the instance's own tools (Docker, the benchmark checkout, `bwrap`). `plan` prints baseline, candidate and smoke trial counts and search-role invocations (analyst, proposer, critic) for the configured `T`, `k` and `m`, for example 178 baseline and up to 7,120 candidate trials for `coding`. They are upper bounds, not spend or latency, and exclude judge calls, retries and infrastructure reruns. Search-role figures count invocations, not model calls or tokens: the analyst and its digester subagents run several model turns per invocation, and a proposer or critic invocation may make more than one model call. Note that `round --dry-run` is not free: it still makes paid analyst calls.
+1. **`doctor`** checks Python, the `anthropic` package (found, not imported), that `RRSI_VERTEX_PROJECTS` is set (only the project count is shown), git, the configuration, the runs directory, the proposer constitution and harness files, the domain contract (required methods, briefs and constitution files; no task set is loaded for it), the evolve task set, and the instance's own tools (Docker, the benchmark checkout, `bwrap`). It reports all failures together, with a remedy where one exists, so fix them before spending anything.
+2. **`plan`** prints baseline, candidate and smoke trial counts and search-role invocations (analyst, proposer, critic) for the configured `T`, `k` and `m`, for example 178 baseline and up to 7,120 candidate trials for `coding`. They are upper bounds, not spend or latency, and exclude judge calls, retries and infrastructure reruns. Search-role figures count invocations, not model calls or tokens: the analyst and its digester subagents run several model turns per invocation, and a proposer or critic invocation may make more than one model call. `round --dry-run` is not a free preview: it still makes paid analyst calls.
+3. **`smoke`, `baseline`, `run`** are the steps that spend. `run` is the driver: it resumes from the earliest unsettled round and never skips ahead.
 
-### Evaluation manifests and held-out labels
+**Recovery.**
 
-Every evaluation records its identity (commit, harness tree, `k`, and a hash of the ordered task ids) in `runs/<domain>/manifests/<job>.json` before any trial runs, and in the job's `eval.json`. A job name is bound to that identity: reusing it for a different commit, `k` or task set is refused and the earlier results are kept, so `heldout --label champ` for a different `--ref` needs a new label. A held-out job directory with no manifest (from an older run) is refused the same way; a cached candidate `eval.json` without provenance is reused with a warning.
+* *Progress.* A round is settled once the frontier trajectory has an entry for round t+1. A failed round is retried, and after 3 consecutive rounds that do not settle the driver stops and exits 1, so a broken environment cannot consume the horizon. A candidate rejected on measurement is not a failure: that round settles with H_{t+1} = H_t. A round whose every screened candidate failed evaluation for infrastructure reasons is not settled; re-running it reuses the completed drafts and evaluations. The driver reports `all rounds settled` only when T rounds are settled and exits 1 otherwise; `--start N` beyond the earliest unsettled round also exits 1.
+* *Stop and resume.* `touch runs/<name>/STOP` stops the driver before the next round; it names that round, exits 0 and does not report completion. Remove the file and rerun `run` to resume.
+* *Interrupted settlements.* A round settles as one recoverable step: `runs/<name>/settlement.json` is written as `pending`, `evolve/<name>` moves to H_{t+1} by compare-and-swap, the frontier is replaced atomically, and the record is marked `done`. If the process dies part-way, the next `round`, `baseline`, `readjudicate` or `reevaluate` completes the settlement from that record before anything else, without re-evaluating. If the branch has moved somewhere the record does not expect, the command exits explaining why and changes nothing; restore the branch, or remove `settlement.json` to abandon the settlement.
+* *One writer per domain.* `baseline`, `calibrate`, `round`, `readjudicate`, `reevaluate`, `heldout` and `smoke` hold `runs/<name>/.lock` while they run (POSIX `flock`, released by the OS however the process ends). A second writer exits naming the holder's pid. `run` takes no lock itself, since each round it launches does; `status`, `doctor` and `plan` never do.
+* *Settled rounds are final.* `round --t <t>` for a settled round is refused and changes nothing. `readjudicate --t <t>` and `reevaluate --t <t>` apply only to the most recently settled round, because a later round was drafted from its outcome; their preconditions are checked before any file is touched.
+
+**Evidence rules.**
+
+* *Configuration is validated at load.* `rrsi.json` and command-line overrides are range-checked (`T` and `k` at least 1, `1 <= m <= 8`, `1 <= b_min <= b_max`, `0 <= m_draft <= m`, finite nonnegative noise and cost parameters, and so on); every problem is reported at once and the command does not start. A key that looks like a misspelled core hyperparameter (`bta1`) prints a warning, and other unknown keys are kept as domain extensions. An empty `RRSI_VERTEX_PROJECTS` fails with a clear message.
+* *Missing trials keep the denominator.* A task with fewer than k trials counts the shortfall as missing trials scoring 0. NaN or out-of-range rewards, misaligned weight or token lists, and duplicate or unrequested tasks fail the evaluation (`EvaluationError`) instead of inflating the score.
+* *Unknown token cost blocks admission.* If the candidate or the incumbent has no positive token count, Delta C is unknown and the candidate is not admissible (`cost evidence incomplete`); earlier versions treated unknown as 0. Set `"allow_unknown_cost": true` in `rrsi.json` to admit such candidates on score alone (a research override; the decision still records Delta C as unknown). `eval.json` carries `token_coverage`, the share of trial slots that C is averaged over. `readjudicate` of a legacy round re-applies this rule, so a candidate without token counts that the old rule accepted is now rejected unless the override is set.
+* *Evaluation manifests.* Every evaluation records its identity (commit, harness tree, `k`, and a hash of the ordered task ids) in `runs/<name>/manifests/<job>.json` before any trial runs, and in the job's `eval.json`. A job name is bound to that identity: reusing it for a different commit, `k` or task set is refused and the earlier results are kept. A cached candidate `eval.json` whose identity differs is refused; one without provenance (an older run) is reused with a warning. The incumbent's and calibration's stored evaluations, and `readjudicate`, do not yet re-verify provenance.
+* *Held-out labels.* `heldout --label <label> [--ref <ref>]` binds the label to one ref (its commit), `k` and task set. Reusing the label for another `--ref` is refused and the recorded results are kept, so use a new label. A held-out job directory with no manifest (an older run) is refused the same way.
 
 ## 📊 Results
 
@@ -157,24 +172,35 @@ The search is not tied to one policy family: with Gemini 3.5 Flash as the frozen
 
 ## 🧱 Adding a domain
 
-A domain is one module, `domains/<name>/adapter.py`, exporting `DOMAIN`, an
-instance of `rrsi.domain.Domain` that implements:
+A domain is a Python package, `domains/<name>/` (with an `__init__.py`), whose
+`adapter.py` exports `DOMAIN`, an instance of `rrsi.domain.Domain` that
+implements:
 
 * `evolve_ids`, `heldout_ids`, `smoke_ids`: the task splits;
 * `run(root, runs_dir, job, ids, k)` and `score(runs_dir, job, ids, k)`: run the harness checked out under `root` and return per-task trial rewards (Evaluate);
 * `load_trial`, `render_trace`, `task_row`: the evidence the analyst, digester and proposer read;
 * `smoke`: a liveness check of a candidate before it is evaluated;
 * `critic_patterns`, `component_signals`, `briefs`, `guards`: the domain's leakage denylist, diff-to-component signals, role prompts and non-compensatory acceptance criteria;
+* optionally `doctor_checks`: the domain's own offline prerequisite checks for `doctor`;
 
 plus `harness_path` (the evolvable directory), `SKILL.md` and `PATTERNS.md`
 (the proposer's constitution) and `rrsi.json` (hyperparameters). The core
 never reads a trajectory format or a benchmark directory itself.
 
+The adapter imports its sibling modules package-qualified, for example
+`from domains.<name> import briefs, render`, so two domains loaded in one
+process never share a module. `doctor` runs `validate_domain` on the adapter
+(required methods overridden, the four briefs, the constitution files) without
+loading a task set; it does not yet check the split rules, result cardinality
+or renderer behavior.
+
 ## 🧪 Tests
 
 ```bash
-python3 -m pytest tests            # or: python3 tests/test_core.py
+python3 -m pytest -q               # or: python3 tests/test_core.py
 ```
+
+The suite is offline: it makes no model call and needs no `anthropic` package, credentials, Docker or benchmark checkout. CI (`.github/workflows/tests.yml`) runs it on Python 3.10, 3.11 and 3.12 with only `pytest` installed.
 
 ## 🙏 Acknowledgements
 

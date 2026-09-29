@@ -29,11 +29,12 @@
 """RRSI command line.
 
   python3 rrsi.py --domain eng doctor [--json]         # offline prerequisite checks (exit 1 on a failure)
-  python3 rrsi.py --domain eng plan [--json]           # offline upper-bound trial and call counts
+  python3 rrsi.py --domain eng plan [--json]           # offline upper-bound trial and search-role invocation counts
   python3 rrsi.py --domain eng baseline                # evaluate H_0, seed the frontier
   python3 rrsi.py --domain eng calibrate [--jobs base,base2]   # noise band delta
   python3 rrsi.py --domain eng round --t 3 [--dry-run] # one round (Alg. 1 + Alg. 2); --dry-run still calls the analyst (paid)
-  python3 rrsi.py --domain eng run [--start 0]         # driver: rounds until T
+  python3 rrsi.py --domain eng run [--start 0]         # driver: rounds until T; always resumes at the earliest
+                                                       # unsettled round, --start beyond it exits 1
   python3 rrsi.py --domain eng readjudicate --t 3      # re-apply Alg. 2 to round 3's stored measurements
   python3 rrsi.py --domain eng reevaluate --t 3        # re-measure round 3's candidates (infra failure), then re-adjudicate
   python3 rrsi.py --domain workspace heldout --label champ [--ref <commit>] [--set heldout]
