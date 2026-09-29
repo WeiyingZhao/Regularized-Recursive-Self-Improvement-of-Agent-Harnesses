@@ -64,6 +64,11 @@ def rev(cwd, ref: str) -> str:
     return git(cwd, "rev-parse", "--short", ref).stdout.strip()
 
 
+def full_rev(cwd, ref: str) -> str:
+    """Full commit id of `ref`; "" when it does not resolve to a commit."""
+    return git(cwd, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+
+
 def tree_hash(cwd, ref: str, path: str) -> str:
     return git(cwd, "rev-parse", f"{ref}:{path}").stdout.strip()[:12]
 
@@ -124,3 +129,9 @@ def fast_forward(repo: Path, branch: str, commit: str) -> None:
     if r.returncode != 0:
         raise RuntimeError(f"{commit} is not a fast-forward of {branch}")
     git(repo, "update-ref", f"refs/heads/{branch}", commit, check=True)
+
+
+def update_ref_cas(repo: Path, branch: str, new: str, old: str) -> None:
+    """Compare-and-swap refs/heads/<branch> from <old> to <new>; raises when the
+    branch is no longer at <old> (another writer moved it)."""
+    git(repo, "update-ref", f"refs/heads/{branch}", new, old, check=True)

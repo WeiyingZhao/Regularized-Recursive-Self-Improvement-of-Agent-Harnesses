@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 
 from .components import K
+from .state import atomic_write_text
 
 MEASURED_OUTCOMES = ("ACCEPTED", "REJECTED", "LOST")
 
@@ -100,10 +101,11 @@ class History:
 
     def replace_round(self, t: int, keep=lambda r: False) -> None:
         """Drop the per-edit records of round t (a re-adjudication rewrites
-        them); records satisfying `keep` survive."""
+        them); records satisfying `keep` survive. The file is replaced atomically."""
         recs = [r for r in self.records()
                 if not (r.get("t") == t and r.get("edit_id")) or keep(r)]
-        self.path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs))
+        atomic_write_text(self.path, "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                            for r in recs))
 
     def has(self, t: int, variant: str) -> bool:
         return any(r.get("t") == t and r.get("variant") == variant

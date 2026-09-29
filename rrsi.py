@@ -43,11 +43,16 @@
 Hyperparameters come from domains/<domain>/rrsi.json; any of them can be
 overridden on the command line (--T, --k, --m, --b-min, --b-max, --w,
 --m-draft, --delta, --beta0, --beta1, --w-s, --w-c, --w-n, --n-prune).
+
+Commands that change run state hold runs/<domain>/.lock; a second concurrent
+writer for the same domain exits naming the holder's pid. `run` takes no lock
+itself (each round it launches does), nor do status, doctor and plan.
 """
 
 import argparse
 import json
 import sys
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -62,7 +67,10 @@ from rrsi.driver import drive                # noqa: E402
 from rrsi.loop import Run                    # noqa: E402
 from rrsi.planning import estimate_workload, render_workload, task_counts  # noqa: E402
 from rrsi.schedule import budget_table       # noqa: E402
+from rrsi.state import RunLock               # noqa: E402
 
+# commands that write run state or the evolve branch: one writer per domain at a time
+MUTATING = ("baseline", "calibrate", "round", "readjudicate", "reevaluate", "heldout", "smoke")
 OVERRIDES = ["T", "k", "m", "b_min", "b_max", "w", "m_draft", "delta", "delta_z",
              "beta0", "beta1", "w_s", "w_c", "w_n", "n_prune", "eval_parallel"]
 
@@ -137,40 +145,41 @@ def main():
         return cmd_plan(domain, cfg, args.json)
     run = Run(domain, cfg, ROOT, Path(args.runs))
 
-    if args.cmd == "baseline":
-        run.baseline(args.job)
-        run.calibrate([args.job])
-    elif args.cmd == "calibrate":
-        run.calibrate([j.strip() for j in args.jobs.split(",") if j.strip()])
-    elif args.cmd == "round":
-        run.round(args.t, dry_run=args.dry_run)
-    elif args.cmd == "readjudicate":
-        run.readjudicate(args.t)
-    elif args.cmd == "reevaluate":
-        run.reevaluate(args.t, [v for v in args.variants.split(",") if v] or None)
-    elif args.cmd == "run":
-        drive(Path(__file__), args.domain, Path(args.runs), cfg.T, args.start,
-              extra_args=[a for k in OVERRIDES if getattr(args, k) is not None
-                          for a in ("--" + k.replace("_", "-"), str(getattr(args, k)))])
-    elif args.cmd == "heldout":
-        ids = domain.heldout_ids() if args.set == "heldout" else domain.evolve_ids()
-        if not ids:
-            sys.exit(f"domain {domain.name} has no {args.set} split")
-        run.heldout(args.label, ids, ref=args.ref)
-    elif args.cmd == "smoke":
-        run.ensure_branch()
-        wt = run.checkout("smoke", run.branch)
-        ok, detail = domain.smoke(wt, run.runs, "smoke", domain.smoke_ids())
-        print(json.dumps({"ok": ok, **detail}, indent=1))
-        sys.exit(0 if ok else 1)
-    elif args.cmd == "status":
-        fr = run.frontier()
-        print(json.dumps({k: v for k, v in fr.items() if k != "config"}, indent=1))
-        print("b_t schedule:", budget_table(cfg.T, cfg.b_min, cfg.b_max))
-        print(f"delta = {run.delta():.5f}")
-        for r in run.history.render(60):
-            print(json.dumps(r, ensure_ascii=False))
-        print("evolve branch:", G.rev(ROOT, run.branch), "tree", run.harness_tree(run.branch))
+    with RunLock(run.runs / ".lock") if args.cmd in MUTATING else nullcontext():
+        if args.cmd == "baseline":
+            run.baseline(args.job)
+            run.calibrate([args.job])
+        elif args.cmd == "calibrate":
+            run.calibrate([j.strip() for j in args.jobs.split(",") if j.strip()])
+        elif args.cmd == "round":
+            run.round(args.t, dry_run=args.dry_run)
+        elif args.cmd == "readjudicate":
+            run.readjudicate(args.t)
+        elif args.cmd == "reevaluate":
+            run.reevaluate(args.t, [v for v in args.variants.split(",") if v] or None)
+        elif args.cmd == "run":
+            drive(Path(__file__), args.domain, Path(args.runs), cfg.T, args.start,
+                  extra_args=[a for k in OVERRIDES if getattr(args, k) is not None
+                              for a in ("--" + k.replace("_", "-"), str(getattr(args, k)))])
+        elif args.cmd == "heldout":
+            ids = domain.heldout_ids() if args.set == "heldout" else domain.evolve_ids()
+            if not ids:
+                sys.exit(f"domain {domain.name} has no {args.set} split")
+            run.heldout(args.label, ids, ref=args.ref)
+        elif args.cmd == "smoke":
+            run.ensure_branch()
+            wt = run.checkout("smoke", run.branch)
+            ok, detail = domain.smoke(wt, run.runs, "smoke", domain.smoke_ids())
+            print(json.dumps({"ok": ok, **detail}, indent=1))
+            sys.exit(0 if ok else 1)
+        elif args.cmd == "status":
+            fr = run.frontier()
+            print(json.dumps({k: v for k, v in fr.items() if k != "config"}, indent=1))
+            print("b_t schedule:", budget_table(cfg.T, cfg.b_min, cfg.b_max))
+            print(f"delta = {run.delta():.5f}")
+            for r in run.history.render(60):
+                print(json.dumps(r, ensure_ascii=False))
+            print("evolve branch:", G.rev(ROOT, run.branch), "tree", run.harness_tree(run.branch))
 
 
 if __name__ == "__main__":
