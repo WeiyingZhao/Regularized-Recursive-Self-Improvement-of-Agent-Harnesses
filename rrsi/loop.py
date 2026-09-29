@@ -137,57 +137,68 @@ class Run:
 
     # ------------------------------------------------------- settlement --
     def _settle(self, t: int, kind: str, new_commit: str, fr_new: dict,
-                old: str | None = None) -> None:
-        """Move evolve/<domain> to H_{t+1} and write the frontier as one recoverable
-        step: settlement.json `pending` -> CAS the branch old -> new (skipped when
-        equal) -> frontier -> `done`. `old` is the tip the caller planned from
-        (default: the current tip); recover() finishes a crash in between."""
+                old: str | None = None, decisions: list | None = None,
+                history: list | None = None) -> None:
+        """Move evolve/<domain> to H_{t+1} as one recoverable step. Everything is
+        resolved and checked before the first write; then settlement.json is written
+        `pending` and applied (_apply). `old` is the tip the caller planned from
+        (default: the current tip). A readjudicate record also carries the round's
+        decisions and its complete round-t history rows, which _apply writes."""
         old = old or G.full_rev(self.repo, self.branch)
         new = G.full_rev(self.repo, new_commit)
         if not old or not new:
             raise SystemExit(f"round {t} not settled: cannot resolve {self.branch} "
-                             f"({old or '?'}) or {new_commit} ({new or '?'})")
+                             f"({old or '?'}) or {new_commit} ({new or '?'}); nothing was changed")
         if kind == "round" and new != old and G.git(
                 self.repo, "merge-base", "--is-ancestor", old, new).returncode != 0:
             raise SystemExit(f"round {t} not settled: {new_commit} does not descend from "
                              f"{self.branch} at {old[:12]}")
         rec = {"t": t, "kind": kind, "phase": "pending", "old_commit": old,
                "new_commit": new, "frontier": fr_new}
+        if kind == "readjudicate":
+            rec.update(decisions=decisions, history=history)
         atomic_write_json(self.settlement_path, rec)
-        if new != old:
+        self._apply(rec)
+
+    def _apply(self, rec: dict) -> None:
+        """Apply a `pending` settlement: (readjudicate) decisions.json and round t's
+        history rows, then CAS the branch old -> new (skipped once it is at new),
+        the frontier, and `done`. Every step is idempotent, so a crash anywhere is
+        finished by applying the same record again. A branch at any other commit is
+        a SystemExit before anything is written."""
+        t, kind, old, new = rec["t"], rec["kind"], rec["old_commit"], rec["new_commit"]
+        tip = G.full_rev(self.repo, self.branch)
+        if tip not in (old, new):
+            raise SystemExit(
+                f"cannot apply the pending {kind} settlement of round {t}: {self.branch} "
+                f"moved unexpectedly to {tip[:12] or '(missing)'} (expected {old[:12]} before "
+                f"or {new[:12]} after the settlement). Nothing was changed. Restore the "
+                f"branch to one of those commits and re-run, or remove {self.settlement_path} "
+                f"to abandon this settlement")
+        if kind == "readjudicate":
+            atomic_write_json(self.runs / f"r{t}" / "decisions.json", rec["decisions"])
+            self.history.rewrite_round(t, rec["history"])
+        if tip != new:
             G.update_ref_cas(self.repo, self.branch, new, old)
-        self.save_frontier(fr_new)
+        self.save_frontier(rec["frontier"])
         atomic_write_json(self.settlement_path, {**rec, "phase": "done"})
 
     def recover(self) -> int | None:
-        """Finish a settlement left `pending` by a crash: CAS the branch if it is
-        still at the recorded old commit, write the recorded frontier, mark it
-        `done`. Idempotent. -> the round t it settled, or None if none was pending.
-        A branch found anywhere else is a SystemExit and nothing is changed."""
+        """Finish a settlement left `pending` by a crash by applying its record again
+        (_apply). Idempotent. -> the round t it settled, or None if none was pending.
+        A branch that moved elsewhere is a SystemExit and nothing is changed."""
         if not self.settlement_path.exists():
             return None
         rec = json.loads(self.settlement_path.read_text())
         if rec.get("phase") != "pending":
             return None
-        t, kind, old, new = rec["t"], rec["kind"], rec["old_commit"], rec["new_commit"]
-        tip = G.full_rev(self.repo, self.branch)
-        if tip not in (old, new):
-            raise SystemExit(
-                f"cannot finish the interrupted {kind} settlement of round {t}: {self.branch} "
-                f"moved unexpectedly to {tip[:12] or '(missing)'} (expected {old[:12]} before "
-                f"or {new[:12]} after the settlement). Nothing was changed. Restore the "
-                f"branch to one of those commits and re-run, or remove {self.settlement_path} "
-                f"to abandon this settlement")
-        if tip != new:
-            G.update_ref_cas(self.repo, self.branch, new, old)
-        self.save_frontier(rec["frontier"])
-        atomic_write_json(self.settlement_path, {**rec, "phase": "done"})
-        if kind == "round":
-            self._drop_worktrees(t)
-        log(self.domain.name, f"recovered the interrupted {kind} settlement of round {t}: "
-            f"{self.branch} at {new[:12]}, frontier trajectory up to "
-            f"t={rec['frontier']['trajectory'][-1]['t']}")
-        return t
+        self._apply(rec)
+        if rec["kind"] == "round":
+            self._drop_worktrees(rec["t"])
+        log(self.domain.name, f"recovered the interrupted {rec['kind']} settlement of round "
+            f"{rec['t']}: {self.branch} at {rec['new_commit'][:12]}, frontier trajectory up "
+            f"to t={rec['frontier']['trajectory'][-1]['t']}")
+        return rec["t"]
 
     # --------------------------------------------------------- evidence ---
     def build_traces(self, job: str, per_task: dict) -> dict:
@@ -454,18 +465,17 @@ class Run:
         if winner is not None and G.git(self.repo, "merge-base", "--is-ancestor",
                                         inc_entry["commit"], winner.commit).returncode != 0:
             raise SystemExit(f"{winner.commit} does not descend from H_{t} {inc_entry['commit']}")
-        (rdir / "decisions.json").write_text(json.dumps(
-            [x.to_json() for x in decisions], indent=1))
-        self.history.replace_round(t)
+        rows = []                        # round t's complete history, written by the settlement
         for c, dec in zip(cands, decisions):
             if c.ev is None:
-                self.history.append_candidate(t, c.variant, c.edits, c.gate_failure or "not_evaluated",
-                                              None, None, False, None, None, c.diff_path, c.detail)
+                rows += self.history.candidate_rows(t, c.variant, c.edits,
+                                                    c.gate_failure or "not_evaluated", None, None,
+                                                    False, None, None, c.diff_path, c.detail)
                 continue
             outcome = ("ACCEPTED" if c is winner else ("LOST" if dec.admissible else "REJECTED"))
-            self.history.append_candidate(t, c.variant, c.edits, outcome, dec.delta_S, dec.delta_C,
-                                          c is winner, dec.S, dec.C, c.diff_path,
-                                          f"[re-adjudicated delta={delta:.5f}] " + dec.reason)
+            rows += self.history.candidate_rows(t, c.variant, c.edits, outcome, dec.delta_S,
+                                                dec.delta_C, c is winner, dec.S, dec.C, c.diff_path,
+                                                f"[re-adjudicated delta={delta:.5f}] " + dec.reason)
             log(d.name, f"r{t}{c.variant}: S={dec.S:.4f} dS={dec.delta_S:+.4f} dC={dec.delta_C:+.3f} "
                 f"-> {outcome}: {dec.reason}")
         if winner is not None:
@@ -486,7 +496,8 @@ class Run:
             entry = {"t": t + 1, "S": inc_ev.S, "C": inc_ev.C, "commit": inc_entry["commit"],
                      "job": inc_job}
         fr["trajectory"] = fr["trajectory"][:t + 1] + [entry]
-        self._settle(t, "readjudicate", new_commit, fr, old=tip)
+        self._settle(t, "readjudicate", new_commit, fr, old=tip,
+                     decisions=[x.to_json() for x in decisions], history=rows)
         if winner is not None:
             log(d.name, f"re-adjudicated r{t}: ACCEPTED {winner.variant} -> {winner.commit} "
                 f"S={winner.ev.S:.4f} S*={fr['S_star']:.4f}")

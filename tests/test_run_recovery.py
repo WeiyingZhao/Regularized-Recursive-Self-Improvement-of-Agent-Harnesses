@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_domain import ROOT, git, make_run  # noqa: E402
 
 from rrsi import gitops as G  # noqa: E402
+from rrsi.history import History  # noqa: E402
 from rrsi.loop import Run  # noqa: E402
 from rrsi.state import RunLock  # noqa: E402
 
@@ -230,21 +231,55 @@ def test_round_with_some_candidates_invalid_still_settles(fx):
     assert fx.run.frontier()["incumbent"]["variant"] == "A"
 
 
-def test_readjudicate_settles_through_the_settlement_record(fx, monkeypatch):
+def readjudicate_to_h0(fx) -> None:
+    """After round 0 (winner B): in-band gains now buy nothing, so H_1 = H_0."""
     fx.run.round(0)
-    fx.cfg.delta, fx.cfg.w_s = 0.5, 0.0      # in-band gains now buy nothing: H_1 = H_0
-    crash_once(monkeypatch, Run, "save_frontier")
+    fx.cfg.delta, fx.cfg.w_s = 0.5, 0.0
+
+
+@pytest.mark.parametrize("owner,name", [(History, "rewrite_round"),     # before history
+                                        (G, "update_ref_cas"),          # before the ref
+                                        (Run, "save_frontier")])        # before the frontier
+def test_interrupted_readjudicate_recovers_to_one_consistent_state(fx, monkeypatch, owner, name):
+    readjudicate_to_h0(fx)
+    crash_once(monkeypatch, owner, name)
     with pytest.raises(Crash):
         fx.fresh().readjudicate(0)
     st = settlement(fx)
     assert (st["kind"], st["phase"], st["new_commit"]) == ("readjudicate", "pending", fx.base)
-    assert tip(fx) == fx.base                # moved back; the frontier still says B
-    assert fx.run.frontier()["incumbent"]["variant"] == "B"
+    if owner is History:                     # crashed before the rewrite: history untouched
+        assert {r["variant"]: r["outcome"] for r in records(fx, 0)} == {"A": "LOST",
+                                                                        "B": "ACCEPTED"}
+    assert fx.run.frontier()["incumbent"]["variant"] == "B"          # not yet H_0
     assert fx.fresh().recover() == 0
+    assert fx.fresh().recover() is None                               # idempotent
     fr = fx.run.frontier()
-    assert fr["incumbent"]["job"] == "base" and fr["trajectory"][1]["commit"] == G.rev(fx.repo, fx.base)
-    assert {r["variant"]: r["outcome"] for r in records(fx, 0)} == {"A": "REJECTED",
-                                                                    "B": "REJECTED"}
+    assert settlement(fx)["phase"] == "done" and fr == st["frontier"]
+    assert tip(fx) == fx.base and fr["incumbent"]["job"] == "base"
+    assert fr["trajectory"][1]["commit"] == G.rev(fx.repo, fx.base)
+    assert records(fx, 0) == st["history"]
+    assert {r["variant"]: r["outcome"] for r in st["history"]} == {"A": "REJECTED", "B": "REJECTED"}
+    assert json.loads((fx.run.runs / "r0" / "decisions.json").read_text()) == st["decisions"]
+    assert not any(x["admissible"] for x in st["decisions"])
+    assert [r["variant"] for r in fx.run.history.records()] == ["-", "A", "B"]
+
+
+@pytest.mark.parametrize("failure", ["unresolvable", "crash_before_record"])
+def test_readjudicate_failing_before_its_record_changes_nothing(fx, monkeypatch, failure):
+    readjudicate_to_h0(fx)
+    before, ref = snapshot(fx), tip(fx)
+    assert {"history.jsonl", "r0/decisions.json", "frontier.json"} <= set(before)
+    if failure == "unresolvable":            # H_0's commit no longer resolves at settle time
+        real = G.full_rev
+        monkeypatch.setattr(G, "full_rev", lambda cwd, r: real(cwd, r) if r == BRANCH else "")
+        with pytest.raises(SystemExit, match="cannot resolve"):
+            fx.fresh().readjudicate(0)
+    else:
+        crash_once(monkeypatch, Run, "_settle")
+        with pytest.raises(Crash):
+            fx.fresh().readjudicate(0)
+    assert snapshot(fx) == before and tip(fx) == ref
+    assert fx.fresh().recover() is None
 
 
 # ---- the writer lock ------------------------------------------------------------------
