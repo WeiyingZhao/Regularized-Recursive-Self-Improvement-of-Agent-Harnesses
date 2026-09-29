@@ -54,6 +54,9 @@ from dataclasses import asdict, dataclass, field
 from numbers import Real
 from pathlib import Path
 
+from .provenance import ProvenanceError, manifest_path, mismatches, read_manifest
+from .state import atomic_write_json
+
 
 class EvaluationError(ValueError):
     """Trial evidence that cannot be folded into S_hat and C_hat."""
@@ -90,11 +93,13 @@ class EvalResult:
     missing: int
     extra: dict = field(default_factory=dict)   # domain aggregates (pass counts, ...)
     token_coverage: float | None = None   # share of the n_expected slots that C_hat averages
+    provenance: dict | None = None        # rrsi.provenance.fingerprint; None on legacy files
 
     def to_json(self) -> dict:
         d = {"job": self.job, "k": self.k, "S": self.S, "C": self.C,
              "n_expected": self.n_expected, "missing": self.missing,
              "extra": self.extra, "token_coverage": self.token_coverage,
+             "provenance": self.provenance,
              "per_task": {t: asdict(r) for t, r in self.per_task.items()}}
         return d
 
@@ -103,7 +108,8 @@ class EvalResult:
         per = {t: TaskResult(**r) for t, r in d["per_task"].items()}
         return cls(job=d["job"], k=d["k"], per_task=per, S=d["S"], C=d["C"],
                    n_expected=d["n_expected"], missing=d["missing"],
-                   extra=d.get("extra") or {}, token_coverage=d.get("token_coverage"))
+                   extra=d.get("extra") or {}, token_coverage=d.get("token_coverage"),
+                   provenance=d.get("provenance"))
 
     def save(self, path: Path | str) -> None:
         Path(path).write_text(json.dumps(self.to_json(), indent=1))
@@ -197,12 +203,30 @@ def aggregate(job: str, k: int, per_task: dict, extra: dict | None = None,
 
 
 def evaluate(domain, root: Path, runs_dir: Path, job: str, ids: list[str],
-             k: int, log_prefix: str = "") -> EvalResult:
+             k: int, log_prefix: str = "", provenance: dict | None = None) -> EvalResult:
     """Run H' (the harness checked out under `root`) on `ids` with k trials and
-    score it. Resume-safe: the domain runner fills only missing trials."""
+    score it. Resume-safe: the domain runner fills only missing trials.
+
+    With `provenance` (rrsi.provenance.fingerprint) the job name is bound to that
+    identity: a manifest recorded under a different one raises ProvenanceError before
+    the runner starts, and a fresh job's manifest is written before it starts."""
+    if provenance is not None:
+        recorded = read_manifest(runs_dir, job)
+        if recorded is None:
+            mp = manifest_path(runs_dir, job)
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(mp, provenance)
+        else:
+            bad = mismatches(provenance, recorded)
+            if bad:
+                raise ProvenanceError(
+                    f"job {job}: {manifest_path(runs_dir, job)} records a different evaluation "
+                    f"({'; '.join(bad)}); the recorded results are kept, use a new job name")
     domain.run(root, runs_dir, job, ids, k, log_prefix=log_prefix)
     per_task, extra = domain.score(runs_dir, job, ids, k)
-    return aggregate(job, k, per_task, extra, expected_ids=ids)
+    ev = aggregate(job, k, per_task, extra, expected_ids=ids)
+    ev.provenance = dict(provenance) if provenance is not None else None
+    return ev
 
 
 def cost_known(C: float | None) -> bool:

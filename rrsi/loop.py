@@ -67,6 +67,7 @@ from .critic import review
 from .evaluate import EvalResult, evaluate
 from .history import History, exploration, stall_flag
 from .propose import propose
+from .provenance import ProvenanceError, fingerprint, mismatches, read_manifest
 from .schedule import edit_budget
 from .selection import Candidate, select_round
 from .state import atomic_write_json
@@ -139,6 +140,10 @@ class Run:
 
     def harness_tree(self, ref: str) -> str:
         return G.tree_hash(self.repo, ref, self.harness_rel)
+
+    def fingerprint(self, ref: str, ids: list[str], k: int | None = None) -> dict:
+        """Evaluation identity (commit, harness tree, k, task set) of `ref`."""
+        return fingerprint(self.repo, ref, self.harness_rel, ids, k or self.cfg.k)
 
     # ------------------------------------------------------- settlement --
     def _settle(self, t: int, kind: str, new_commit: str, fr_new: dict,
@@ -260,8 +265,11 @@ class Run:
         wt = self.checkout("incumbent", self.branch)
         ids = self.domain.evolve_ids()
         log(self.domain.name, f"baseline: {len(ids)} tasks x k={self.cfg.k} -> job {job}")
-        ev = evaluate(self.domain, wt, self.runs, job, ids, self.cfg.k,
-                      log_prefix=f"{job}")
+        try:
+            ev = evaluate(self.domain, wt, self.runs, job, ids, self.cfg.k, log_prefix=f"{job}",
+                          provenance=self.fingerprint(self.branch, ids))
+        except ProvenanceError as e:
+            raise SystemExit(f"baseline: {e}") from None
         ev.save(self.eval_path(job))
         if ev.missing > self.cfg.invalid_missing_frac * ev.n_expected:
             raise SystemExit(f"baseline invalid: {ev.missing}/{ev.n_expected} trials missing")
@@ -293,11 +301,30 @@ class Run:
 
     def heldout(self, label: str, ids: list[str], ref: str | None = None,
                 k: int | None = None) -> EvalResult:
+        """Evaluate `ref` (default the incumbent branch) on `ids` as job heldout_<label>.
+        A label is bound to one (commit, k, task set): reusing it for anything else, or
+        for a job directory of unknown origin, is refused with the evidence untouched."""
         ref = ref or self.branch
-        wt = self.checkout(f"heldout_{label}", ref)
+        k = k or self.cfg.k
         job = f"heldout_{label}"
-        ev = evaluate(self.domain, wt, self.runs, job, ids, k or self.cfg.k,
-                      log_prefix=job)
+        try:
+            fp = self.fingerprint(ref, ids, k)
+            recorded = read_manifest(self.runs, job)
+        except ProvenanceError as e:
+            raise SystemExit(f"heldout {label}: {e}") from None
+        if recorded is None and (self.jobs / job).exists():
+            raise SystemExit(f"heldout {label}: {self.jobs / job} already exists but has no "
+                             f"evaluation manifest (legacy or unknown origin), so its harness "
+                             f"cannot be verified; nothing was changed. Use a new --label")
+        if recorded is not None:
+            bad = mismatches(fp, recorded)
+            if bad:
+                raise SystemExit(f"heldout {label}: label already used for commit "
+                                 f"{recorded.get('commit')}, refusing to evaluate commit "
+                                 f"{fp['commit']} under it ({'; '.join(bad)}); the recorded "
+                                 f"results are kept. Use a new --label")
+        wt = self.checkout(f"heldout_{label}", ref)
+        ev = evaluate(self.domain, wt, self.runs, job, ids, k, log_prefix=job, provenance=fp)
         ev.save(self.eval_path(job))
         log(self.domain.name, f"heldout {label} @ {G.rev(self.repo, ref)}: S={ev.S:.4f} "
             f"C={ev.C} missing={ev.missing}/{ev.n_expected} {json.dumps(ev.extra)[:200]}")
@@ -707,15 +734,28 @@ class Run:
         d, cfg = self.domain, self.cfg
         job = f"r{t}{c.variant}"
         ep = rdir / c.variant / "eval.json"
+        fp = self.fingerprint(c.commit, ids)
         if ep.exists():
-            c.ev = EvalResult.load(ep)
-            log(d.name, f"{c.variant}: reusing eval.json")
+            cached = EvalResult.load(ep)
+            if cached.provenance is None:
+                log(d.name, f"{c.variant}: WARNING reusing {ep} without provenance (legacy "
+                    f"artifact: its harness, tasks and k are not verified)")
+            else:
+                bad = mismatches(fp, cached.provenance)
+                if bad:
+                    raise SystemExit(f"{ep} was measured for a different evaluation than "
+                                     f"{job} now requires ({'; '.join(bad)}); it is kept. "
+                                     f"Remove it deliberately to re-measure")
+                log(d.name, f"{c.variant}: reusing eval.json")
+            c.ev = cached
             return
         wt = self.wt_root / job
         ev = None
         for attempt in range(2):
             try:
-                ev = evaluate(d, wt, self.runs, job, ids, cfg.k, log_prefix=job)
+                ev = evaluate(d, wt, self.runs, job, ids, cfg.k, log_prefix=job, provenance=fp)
+            except ProvenanceError:
+                raise                    # an operator error (a job name reused), not infrastructure
             except Exception as e:  # noqa: BLE001
                 c.gate_failure, c.detail = "eval_invalid", f"evaluation crashed: {e!r}"[:600]
                 log(d.name, f"{c.variant}: {c.detail}")
