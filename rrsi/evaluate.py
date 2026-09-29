@@ -39,13 +39,24 @@ Rewards may carry weights. Every coding / engineering trial has weight 1; a
 Harvey LAB trial has reward = criteria passed / criteria total and weight =
 criteria total, so S_hat is the fraction of criteria passed over all tasks, the
 benchmark's own metric (Appendix, Harvey LAB).
+
+`aggregate` does not trust adapter cardinality: it checks every task against the
+requested set, pads any task with fewer than k trials as missing (never as an
+absent slot), and rejects non-finite or out-of-range evidence. Delta C is unknown
+(None), never 0, when either side lacks a positive token count.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
+from numbers import Real
 from pathlib import Path
+
+
+class EvaluationError(ValueError):
+    """Trial evidence that cannot be folded into S_hat and C_hat."""
 
 
 @dataclass
@@ -78,11 +89,12 @@ class EvalResult:
     n_expected: int
     missing: int
     extra: dict = field(default_factory=dict)   # domain aggregates (pass counts, ...)
+    token_coverage: float | None = None   # share of the n_expected slots that C_hat averages
 
     def to_json(self) -> dict:
         d = {"job": self.job, "k": self.k, "S": self.S, "C": self.C,
              "n_expected": self.n_expected, "missing": self.missing,
-             "extra": self.extra,
+             "extra": self.extra, "token_coverage": self.token_coverage,
              "per_task": {t: asdict(r) for t, r in self.per_task.items()}}
         return d
 
@@ -91,7 +103,7 @@ class EvalResult:
         per = {t: TaskResult(**r) for t, r in d["per_task"].items()}
         return cls(job=d["job"], k=d["k"], per_task=per, S=d["S"], C=d["C"],
                    n_expected=d["n_expected"], missing=d["missing"],
-                   extra=d.get("extra") or {})
+                   extra=d.get("extra") or {}, token_coverage=d.get("token_coverage"))
 
     def save(self, path: Path | str) -> None:
         Path(path).write_text(json.dumps(self.to_json(), indent=1))
@@ -101,22 +113,87 @@ class EvalResult:
         return cls.from_json(json.loads(Path(path).read_text()))
 
 
-def aggregate(job: str, k: int, per_task: dict, extra: dict | None = None) -> EvalResult:
-    """Fold per-task trial records into S_hat and C_hat."""
+def _real(x) -> bool:
+    return isinstance(x, Real) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _checked(tid, tr: TaskResult, k: int) -> TaskResult:
+    """A validated copy of `tr` padded to k trials; every padded trial is missing."""
+    n = len(tr.rewards)
+    if len(tr.weights) != n or len(tr.tokens) != n:
+        raise EvaluationError(f"task {tid}: {n} rewards but {len(tr.weights)} weights and "
+                              f"{len(tr.tokens)} token entries (must align)")
+    if n > k:
+        raise EvaluationError(f"task {tid}: {n} trials reported for k={k}")
+    for name, xs in (("reward", tr.rewards), ("weight", tr.weights)):
+        for x in xs:
+            if not _real(x):
+                raise EvaluationError(f"task {tid}: {name} {x!r} is not a finite number")
+    for x in tr.rewards:
+        if not 0.0 <= x <= 1.0:
+            raise EvaluationError(f"task {tid}: reward {x!r} outside [0, 1]")
+    for x in tr.weights:
+        if x < 0:
+            raise EvaluationError(f"task {tid}: negative weight {x!r}")
+    for x in tr.tokens:
+        if x is not None and (not _real(x) or x < 0):
+            raise EvaluationError(f"task {tid}: token count {x!r} is not a non-negative number or None")
+    if not _real(tr.missing) or int(tr.missing) != tr.missing or tr.missing < 0:
+        raise EvaluationError(f"task {tid}: missing={tr.missing!r} is not a non-negative integer")
+    pad = k - n
+    w = max((float(x) for x in tr.weights), default=1.0)
+    missing = int(tr.missing) + pad
+    if missing > k:
+        raise EvaluationError(f"task {tid}: {missing} missing trials for k={k}")
+    return TaskResult(rewards=[float(x) for x in tr.rewards] + [0.0] * pad,
+                      weights=[float(x) for x in tr.weights] + [w] * pad,
+                      tokens=list(tr.tokens) + [None] * pad, missing=missing,
+                      extra=tr.extra)
+
+
+def aggregate(job: str, k: int, per_task: dict, extra: dict | None = None,
+              expected_ids: list[str] | None = None) -> EvalResult:
+    """Fold per-task trial records into S_hat and C_hat.
+
+    With `expected_ids` the task set is exactly the requested one: a requested task
+    the adapter did not report is k missing trials (reward 0, weight 1), an unrequested
+    one is an error. A task with fewer than k trials is padded to k with missing
+    trials (reward 0, the task's largest weight), so a shortfall keeps the full
+    denominator instead of shrinking it."""
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise EvaluationError(f"k must be a positive integer (got {k!r})")
+    if expected_ids is None:
+        if not per_task:
+            raise EvaluationError("no tasks were scored")
+        ids = list(per_task)
+    else:
+        ids = list(expected_ids)
+        if not ids:
+            raise EvaluationError("no tasks were requested")
+        dup = sorted({t for t in ids if ids.count(t) > 1})
+        if dup:
+            raise EvaluationError(f"duplicate requested task ids: {dup}")
+        extra_ids = sorted(set(per_task) - set(ids))
+        if extra_ids:
+            raise EvaluationError(f"scored tasks that were not requested: {extra_ids}")
+    per = {t: (_checked(t, per_task[t], k) if t in per_task else
+               TaskResult([0.0] * k, [1.0] * k, [None] * k, missing=k)) for t in ids}
     num = den = 0.0
     toks = []
     missing = 0
-    for tr in per_task.values():
+    for tr in per.values():
         for r, w in zip(tr.rewards, tr.weights):
             num += r * w
             den += w
-        toks += [x for x in tr.tokens if isinstance(x, (int, float)) and x > 0]
+        toks += [x for x in tr.tokens if x is not None and x > 0]     # observed counts
         missing += tr.missing
-    return EvalResult(job=job, k=k, per_task=per_task,
-                      S=(num / den) if den else 0.0,
+    if not den > 0:
+        raise EvaluationError("total trial weight is zero; S_hat is undefined")
+    n_expected = len(per) * k
+    return EvalResult(job=job, k=k, per_task=per, S=num / den,
                       C=(sum(toks) / len(toks)) if toks else None,
-                      n_expected=len(per_task) * k, missing=missing,
-                      extra=dict(extra or {}))
+                      n_expected=n_expected, missing=missing,
+                      extra=dict(extra or {}), token_coverage=len(toks) / n_expected)
 
 
 def evaluate(domain, root: Path, runs_dir: Path, job: str, ids: list[str],
@@ -125,11 +202,17 @@ def evaluate(domain, root: Path, runs_dir: Path, job: str, ids: list[str],
     score it. Resume-safe: the domain runner fills only missing trials."""
     domain.run(root, runs_dir, job, ids, k, log_prefix=log_prefix)
     per_task, extra = domain.score(runs_dir, job, ids, k)
-    return aggregate(job, k, per_task, extra)
+    return aggregate(job, k, per_task, extra, expected_ids=ids)
 
 
-def relative_cost_change(C_cand: float | None, C_inc: float | None) -> float:
-    """Delta C = (C' - C_t) / C_t; 0 when either side has no token count."""
-    if not C_cand or not C_inc:
-        return 0.0
+def cost_known(C: float | None) -> bool:
+    """True when C is an observed mean token count (a finite positive number)."""
+    return isinstance(C, (int, float)) and not isinstance(C, bool) and math.isfinite(C) and C > 0
+
+
+def relative_cost_change(C_cand: float | None, C_inc: float | None) -> float | None:
+    """Delta C = (C' - C_t) / C_t; None (unknown, never 0) when either side has no
+    positive token count."""
+    if not (cost_known(C_cand) and cost_known(C_inc)):
+        return None
     return (C_cand - C_inc) / C_inc

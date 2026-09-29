@@ -53,6 +53,8 @@ components that stop helping are pruned.
 | Noise band delta | fixed per instance in `rrsi.json` (0.017 / 0.004 / 0.020); `rrsi/calibrate.py` re-estimates it when `delta` is `null` (bootstrap over trials of the base evaluation, or repeated base evaluations) |
 | Non-compensatory domain criteria | `Domain.guards` (engineering: valid-rate drop, no-submission rise) |
 
+**Cost evidence.** A task with fewer than k trials counts the shortfall as missing trials, and malformed rewards, weights or task sets fail the evaluation (`EvaluationError`). If either the candidate or the incumbent has no positive token count, Delta C is unknown and the candidate is not admissible (`cost evidence incomplete`); earlier versions treated unknown as 0. Set `"allow_unknown_cost": true` in `rrsi.json` to admit such candidates on score alone (research override; the decision still records Delta C as unknown). `eval.json` now carries `token_coverage`, the share of trial slots that C is averaged over.
+
 ---
 
 ## ⚡️ Quickstart

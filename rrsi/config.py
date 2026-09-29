@@ -104,6 +104,8 @@ class RRSIConfig:
     w_c: float = 15.0
     w_n: float = 0.5
     n_prune: int = 4
+    allow_unknown_cost: bool = False    # research override: admit a candidate whose Delta C
+                                        # is unknown (a side has no token counts) on score alone
     # ---- engineering knobs (not part of the method) ----------------------
     repair_rounds: int = 5          # critic -> proposer repair attempts
     invalid_missing_frac: float = 0.15
@@ -173,6 +175,8 @@ class RRSIConfig:
         for name in ("beta0", "beta1", "w_s", "w_c", "w_n"):
             number(name, 0.0)
         number("invalid_missing_frac", 0.0, 1.0)
+        if not isinstance(self.allow_unknown_cost, bool):
+            errs.append(f"allow_unknown_cost: must be true or false (got {self.allow_unknown_cost!r})")
         for name in ("proposer_model", "analyst_model", "critic_model"):
             v = getattr(self, name)
             if not isinstance(v, str) or not v.strip():

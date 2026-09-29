@@ -76,6 +76,11 @@ def log(domain: str, msg: str) -> None:
     print(f"[rrsi:{domain}] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
+def _fmt_dc(delta_C: float | None) -> str:
+    """Delta C for a log line; unknown cost prints n/a, never a number."""
+    return "n/a" if delta_C is None else f"{delta_C:+.3f}"
+
+
 class Run:
     """Paths, state and git plumbing of one domain's evolution."""
 
@@ -411,7 +416,7 @@ class Run:
                                           c.diff_path, dec.reason)
             self.attribute(t, c.variant, c.edits, inc_ev, c.ev)
             log(d.name, f"{c.variant}: S={dec.S:.4f} dS={dec.delta_S:+.4f} "
-                f"dC={dec.delta_C:+.3f} nu={dec.novelty} -> {outcome}: {dec.reason}")
+                f"dC={_fmt_dc(dec.delta_C)} nu={dec.novelty} -> {outcome}: {dec.reason}")
 
         # 7) H_{t+1}: branch and frontier move together (recoverable, see _settle)
         if winner is not None:
@@ -476,7 +481,7 @@ class Run:
             rows += self.history.candidate_rows(t, c.variant, c.edits, outcome, dec.delta_S,
                                                 dec.delta_C, c is winner, dec.S, dec.C, c.diff_path,
                                                 f"[re-adjudicated delta={delta:.5f}] " + dec.reason)
-            log(d.name, f"r{t}{c.variant}: S={dec.S:.4f} dS={dec.delta_S:+.4f} dC={dec.delta_C:+.3f} "
+            log(d.name, f"r{t}{c.variant}: S={dec.S:.4f} dS={dec.delta_S:+.4f} dC={_fmt_dc(dec.delta_C)} "
                 f"-> {outcome}: {dec.reason}")
         if winner is not None:
             new_commit = winner.commit

@@ -36,6 +36,10 @@ For every screened candidate H' with measurement (S', C'):
 
     H_{t+1} = argmax_{H' admissible} S',  or H_t if none is admissible
     S*      = max(S*, S_{t+1})
+
+Delta C is unknown when either side has no token counts; such a candidate is not
+admissible (cost evidence incomplete) unless cfg.allow_unknown_cost, which runs the
+rule with Delta C = 0 but still records Delta C as unknown.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .components import novelty
-from .evaluate import EvalResult, relative_cost_change
+from .evaluate import EvalResult, cost_known, relative_cost_change
 
 
 @dataclass
@@ -109,7 +113,16 @@ def judge(cand: Candidate, incumbent: EvalResult, S_star: float, delta: float,
         d.reason = (f"below noise-adjusted floor: S' {ev.S:.4f} < S* {S_star:.4f} "
                     f"- delta {delta:.4f}")
         return d
-    ok, why = cost_rule(dS, dC, nov, delta, cfg)
+    if dC is None:
+        lacking = " and ".join(side for side, C in (("candidate", ev.C), ("incumbent", incumbent.C))
+                               if not cost_known(C))
+        if not cfg.allow_unknown_cost:
+            d.reason = (f"cost evidence incomplete: no token counts for the {lacking}, so "
+                        f"Delta C is unknown (allow_unknown_cost=true admits on score alone)")
+            return d
+    ok, why = cost_rule(dS, 0.0 if dC is None else dC, nov, delta, cfg)
+    if dC is None:
+        why += " (cost unknown; allow_unknown_cost override)"
     if not ok:
         d.reason = f"cost rule failed: {why}"
         return d
