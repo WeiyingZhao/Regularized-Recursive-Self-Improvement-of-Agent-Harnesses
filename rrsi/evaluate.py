@@ -54,7 +54,7 @@ from dataclasses import asdict, dataclass, field
 from numbers import Real
 from pathlib import Path
 
-from .provenance import ProvenanceError, manifest_path, mismatches, read_manifest
+from .provenance import ProvenanceError, manifest_path, mismatches, move_aside, read_manifest
 from .state import atomic_write_json
 
 
@@ -112,7 +112,7 @@ class EvalResult:
                    provenance=d.get("provenance"))
 
     def save(self, path: Path | str) -> None:
-        Path(path).write_text(json.dumps(self.to_json(), indent=1))
+        atomic_write_json(path, self.to_json())
 
     @classmethod
     def load(cls, path: Path | str) -> "EvalResult":
@@ -209,10 +209,17 @@ def evaluate(domain, root: Path, runs_dir: Path, job: str, ids: list[str],
 
     With `provenance` (rrsi.provenance.fingerprint) the job name is bound to that
     identity: a manifest recorded under a different one raises ProvenanceError before
-    the runner starts, and a fresh job's manifest is written before it starts."""
+    the runner starts, and a fresh job's manifest is written before it starts (with a
+    WARNING when jobs/<job>/ already exists: its trials are adopted under it)."""
     if provenance is not None:
         recorded = read_manifest(runs_dir, job)
         if recorded is None:
+            jdir = Path(runs_dir) / "jobs" / job
+            if jdir.exists():
+                from .loop import log            # loop imports this module
+                log(domain.name, f"{job}: WARNING {jdir} already exists without an evaluation "
+                    f"manifest (legacy or unknown origin); its existing trials are adopted "
+                    f"under this evaluation's identity, which the new manifest records")
             mp = manifest_path(runs_dir, job)
             mp.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(mp, provenance)
@@ -221,7 +228,8 @@ def evaluate(domain, root: Path, runs_dir: Path, job: str, ids: list[str],
             if bad:
                 raise ProvenanceError(
                     f"job {job}: {manifest_path(runs_dir, job)} records a different evaluation "
-                    f"({'; '.join(bad)}); the recorded results are kept, use a new job name")
+                    f"({'; '.join(bad)}); nothing was run and the recorded results are kept. "
+                    + move_aside(runs_dir, job))
     domain.run(root, runs_dir, job, ids, k, log_prefix=log_prefix)
     per_task, extra = domain.score(runs_dir, job, ids, k)
     ev = aggregate(job, k, per_task, extra, expected_ids=ids)

@@ -183,6 +183,12 @@ def test_plan_command_prints_the_coding_figures_offline(tmp_path):
     assert not (tmp_path / "runs").exists()          # no run directories
 
 
+def test_plan_help_names_invocations_not_calls(tmp_path):
+    r = _cli("--domain", "coding", "--help", runs=tmp_path / "runs")
+    assert r.returncode == 0 and "search-role invocation counts" in " ".join(r.stdout.split())
+    assert "trial and call counts" not in r.stdout
+
+
 def test_plan_json_and_config_error(tmp_path):
     r = _cli("--domain", "coding", "plan", "--json", runs=tmp_path / "runs")
     d = json.loads(r.stdout)

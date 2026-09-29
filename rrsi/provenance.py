@@ -19,7 +19,9 @@ ordered task ids. It is written as a manifest before the runner starts, at
 runs/<domain>/manifests/<job>.json, outside jobs/<job>/ (runners own that
 directory and may rename it), and stored in eval.json. A later evaluation under
 the same job name must present the same fingerprint or it is refused, never
-silently answered with the earlier harness's results.
+silently answered with the earlier harness's results. A job's identity is only ever
+changed by moving its cached eval.json, manifest and trial directory aside together
+(`move_aside`).
 """
 
 from __future__ import annotations
@@ -62,6 +64,20 @@ def mismatches(expected: dict, recorded: dict) -> list[str]:
 
 def manifest_path(runs_dir: Path | str, job: str) -> Path:
     return Path(runs_dir) / "manifests" / f"{job}.json"
+
+
+def move_aside(runs_dir: Path | str, job: str, cached: Path | str | None = None) -> str:
+    """The remedy for a job whose recorded identity differs from the one now required.
+    Candidate and baseline job names are fixed, so the job's three artifacts must move
+    aside together: a runner reuses trials left in jobs/<job>/, and a fresh manifest
+    would then certify them for a harness they were not measured with."""
+    ev = str(cached) if cached else "its cached eval.json (r<t>/<variant>/eval.json for a candidate)"
+    return (f"To keep the recorded results, restore the configuration they were measured "
+            f"with (k, task set, harness commit). To re-measure under the new identity, move "
+            f"these aside together: {ev}, {manifest_path(runs_dir, job)} and "
+            f"{Path(runs_dir) / 'jobs' / job}/. Moving only some of them is unsafe: a runner "
+            f"reuses the trials left in the job directory and a fresh manifest would certify "
+            f"them")
 
 
 def read_manifest(runs_dir: Path | str, job: str) -> dict | None:

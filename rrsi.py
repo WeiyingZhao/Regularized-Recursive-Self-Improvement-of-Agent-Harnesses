@@ -47,7 +47,9 @@ overridden on the command line (--T, --k, --m, --b-min, --b-max, --w,
 
 Commands that change run state hold runs/<domain>/.lock; a second concurrent
 writer for the same domain exits naming the holder's pid. `run` takes no lock
-itself (each round it launches does), nor do status, doctor and plan.
+itself (each round it launches does), nor do status, doctor and plan. An
+evaluation whose job name is recorded for a different identity (commit, k, task
+set) exits 1 with one message naming the remedy; the recorded results are kept.
 """
 
 import argparse
@@ -67,6 +69,7 @@ from rrsi.domain import load_domain          # noqa: E402
 from rrsi.driver import drive                # noqa: E402
 from rrsi.loop import Run                    # noqa: E402
 from rrsi.planning import estimate_workload, render_workload, task_counts  # noqa: E402
+from rrsi.provenance import ProvenanceError  # noqa: E402
 from rrsi.schedule import budget_table       # noqa: E402
 from rrsi.state import RunLock               # noqa: E402
 
@@ -128,7 +131,8 @@ def main():
     sub.add_parser("smoke")
     sub.add_parser("status")
     for name, help_ in (("doctor", "offline prerequisite checks (exit 1 if any fails)"),
-                        ("plan", "offline upper-bound trial and call counts for a run")):
+                        ("plan", "offline upper-bound trial and search-role invocation counts "
+                                 "for a run")):
         sub.add_parser(name, help=help_).add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -145,7 +149,13 @@ def main():
     if args.cmd == "plan":
         return cmd_plan(domain, cfg, args.json)
     run = Run(domain, cfg, ROOT, Path(args.runs))
+    try:
+        dispatch(run, domain, cfg, args)
+    except ProvenanceError as err:      # a job's recorded identity differs: an operator error
+        sys.exit(f"{args.cmd}: {' '.join(str(err).split())}")
 
+
+def dispatch(run, domain, cfg, args) -> None:
     with RunLock(run.runs / ".lock") if args.cmd in MUTATING else nullcontext():
         if args.cmd == "baseline":
             run.baseline(args.job)

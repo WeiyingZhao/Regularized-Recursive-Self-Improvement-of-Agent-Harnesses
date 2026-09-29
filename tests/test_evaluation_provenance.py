@@ -22,17 +22,20 @@ no model calls, no benchmark.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fake_domain import IDS, POLICY, git, make_run, write_score  # noqa: E402
+from fake_domain import IDS, POLICY, ROOT, git, make_run, write_score  # noqa: E402
 
 from rrsi import gitops as G  # noqa: E402
-from rrsi.evaluate import EvalResult, evaluate  # noqa: E402
+from rrsi.evaluate import EvalResult, TaskResult, aggregate, evaluate  # noqa: E402
 from rrsi.provenance import (SCHEMA, ProvenanceError, fingerprint, manifest_path,  # noqa: E402
                              mismatches)
 from rrsi.selection import Candidate  # noqa: E402
@@ -118,6 +121,31 @@ def test_evaluate_writes_the_manifest_before_the_runner_starts(fx, tmp_path):
     assert not any(p.name.endswith(".tmp") for p in (tmp_path / "manifests").iterdir())
 
 
+def test_evaluate_warns_when_it_adopts_trials_of_a_job_without_a_manifest(fx, tmp_path, capsys):
+    evaluate(fx.domain, fx.repo, tmp_path, "fresh", fx.ids, 2, provenance=fp(fx))
+    assert "WARNING" not in capsys.readouterr().out                    # a new job: nothing to adopt
+    (tmp_path / "jobs" / "old").mkdir(parents=True)                     # legacy or unknown origin
+    evaluate(fx.domain, fx.repo, tmp_path, "old", fx.ids, 2, provenance=fp(fx))
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "adopt" in out and str(tmp_path / "jobs" / "old") in out
+    assert json.loads(manifest_path(tmp_path, "old").read_text()) == fp(fx)
+
+
+def test_evalresult_save_replaces_the_file_atomically(tmp_path, monkeypatch):
+    p = tmp_path / "eval.json"
+    aggregate("j", 2, {"a": TaskResult([1.0, 1.0])}).save(p)
+    old = p.read_bytes()
+
+    def dies(*a, **kw):
+        raise OSError("killed before the rename")
+    with monkeypatch.context() as m:
+        m.setattr(os, "replace", dies)
+        with pytest.raises(OSError):
+            aggregate("j", 2, {"a": TaskResult([0.0, 0.0])}).save(p)
+    assert p.read_bytes() == old and sorted(os.listdir(tmp_path)) == ["eval.json"]
+    assert EvalResult.load(p).S == 1.0
+
+
 def test_evaluate_without_provenance_writes_no_manifest(fx, tmp_path):
     ev = evaluate(fx.domain, fx.repo, tmp_path, "j", fx.ids, 2)
     assert ev.provenance is None and not (tmp_path / "manifests").exists()
@@ -134,9 +162,13 @@ def test_evaluate_refuses_a_job_recorded_under_a_different_k(fx, tmp_path):
     prov = fp(fx)
     evaluate(fx.domain, fx.repo, tmp_path, "j", fx.ids, 2, provenance=prov)
     before, calls = snapshot(tmp_path), fx.domain.n_runs
-    with pytest.raises(ProvenanceError, match=r"k: recorded 2 != expected 3"):
+    with pytest.raises(ProvenanceError, match=r"k: recorded 2 != expected 3") as e:
         evaluate(fx.domain, fx.repo, tmp_path, "j", fx.ids, 3, provenance=fp(fx, k=3))
     assert fx.domain.n_runs == calls and snapshot(tmp_path) == before   # runner untouched, evidence kept
+    msg = str(e.value)                                                  # a remedy that works:
+    assert str(manifest_path(tmp_path, "j")) in msg and str(tmp_path / "jobs" / "j") in msg
+    assert "eval.json" in msg and "together" in msg and "only some" in msg
+    assert "new job name" not in msg                                    # candidate names are fixed
     ev = evaluate(fx.domain, fx.repo, tmp_path, "j", fx.ids, 2, provenance=prov)   # same identity: resumes
     assert fx.domain.n_runs == calls + 1 and ev.provenance == prov
 
@@ -322,3 +354,33 @@ def test_a_manifest_mismatch_aborts_the_round_without_settling_it(fx):
     assert [x["t"] for x in fx.run.frontier()["trajectory"]] == [0]   # round 0 is not settled
     assert not (fx.run.runs / "r0" / "A" / "eval.json").exists()
     assert json.loads(mp.read_text())["commit"] == "0" * 40
+
+
+# ------------------------------------------------------------- CLI boundary --
+def _cli_module():
+    spec = importlib.util.spec_from_file_location("rrsi_cli", ROOT / "rrsi.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_cli_reports_a_provenance_conflict_as_a_clean_exit(tmp_path, monkeypatch):
+    """A ProvenanceError out of a mutating command is an operator error: one message and
+    exit status 1, not a traceback."""
+    cli = _cli_module()
+    (tmp_path / "rrsi.json").write_text("{}")
+
+    class ConflictingRun:
+        def __init__(self, domain, cfg, repo, runs_root):
+            self.runs = Path(runs_root) / domain.name
+
+        def round(self, t, dry_run=False):
+            raise ProvenanceError("job r0A: manifests/r0A.json records a different evaluation")
+    monkeypatch.setattr(cli, "load_domain", lambda name: SimpleNamespace(name=name, root=tmp_path))
+    monkeypatch.setattr(cli, "Run", ConflictingRun)
+    monkeypatch.setattr(sys, "argv", ["rrsi.py", "--domain", "fake", "--runs",
+                                      str(tmp_path / "runs"), "round", "--t", "0"])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert isinstance(e.value.code, str) and "\n" not in e.value.code
+    assert e.value.code.startswith("round: ") and "job r0A" in e.value.code
