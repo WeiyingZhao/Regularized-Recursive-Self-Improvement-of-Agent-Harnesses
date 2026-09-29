@@ -49,6 +49,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent))
 sys.path.insert(0, str(HERE))
+from rrsi.doctor import CheckResult    # noqa: E402
 from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
 import briefs                            # noqa: E402
@@ -127,6 +128,13 @@ class WorkspaceDomain(Domain):
 
     def regression_threshold(self, k: int) -> float:
         return 0.05
+
+    def doctor_checks(self) -> list:
+        if HARVEY_LAB_ROOT.exists():
+            return [CheckResult("harvey lab", "ok", str(HARVEY_LAB_ROOT))]
+        return [CheckResult("harvey lab", "fail", f"{HARVEY_LAB_ROOT} not found",
+                            "git clone https://github.com/harveyai/harvey-labs.git and set "
+                            "HARVEY_LAB_ROOT (pinned commit: harvey_lab_commit in rrsi.json)")]
 
     def _n_criteria(self, task_id: str) -> int:
         if task_id not in self._criteria_count:

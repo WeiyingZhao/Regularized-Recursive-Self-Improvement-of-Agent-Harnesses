@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -50,6 +51,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent))
 sys.path.insert(0, str(HERE))
+from rrsi.doctor import CheckResult    # noqa: E402
 from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
 import briefs                            # noqa: E402
@@ -168,6 +170,30 @@ class EngDomain(Domain):
             if len(solid) >= n:
                 return solid[:n]
         return ids[:n]
+
+    def doctor_checks(self) -> list:
+        needs = (("agent python", AGENT_PY, Path(AGENT_PY).exists() or shutil.which(AGENT_PY),
+                  "set RRSI_AGENT_PYTHON to a Python 3.11 with `pip install -e \".[agentic]\"`"),
+                 ("benchmark root", BENCH_ROOT, BENCH_ROOT.exists(),
+                  "python3 domains/eng/scripts/engdesign/build_engdesign_bench.py --engdesign-open "
+                  "EngDesign/EngDesign-Open --out domains/eng/engdesign_bench   # or set BENCH_ROOT"),
+                 ("grading python", GRADING_PY, GRADING_PY.exists(),
+                  "python3 -m venv domains/eng/.venvs/engdesign && domains/eng/.venvs/engdesign/bin/"
+                  "pip install -r domains/eng/scripts/engdesign/requirements.txt   "
+                  "# or set GRADING_PYTHON"))
+        out = [CheckResult(f"eng {name}", "ok", str(p)) if found
+               else CheckResult(f"eng {name}", "fail", f"{p} not found", fix)
+               for name, p, found, fix in needs]
+        if sys.platform.startswith("linux"):
+            bwrap = shutil.which("bwrap")
+            out.append(CheckResult("bwrap", "ok", bwrap) if bwrap else CheckResult(
+                "bwrap", "fail", "bwrap is not on PATH (code_exec would run unjailed)",
+                "install bubblewrap (e.g. apt install bubblewrap)"))
+        else:
+            out.append(CheckResult(
+                "bwrap", "warn", f"the jailed code_exec needs Linux (bwrap); this is {sys.platform}",
+                "run the eng instance on Linux"))
+        return out
 
     # ---- Evaluate ----------------------------------------------------------
     def _env(self, runs_dir: Path) -> dict:

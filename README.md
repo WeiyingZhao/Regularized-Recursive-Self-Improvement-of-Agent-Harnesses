@@ -120,6 +120,17 @@ python3 rrsi.py --domain eng baseline && python3 rrsi.py --domain eng run
 bash domains/eng/scripts/final_eval.sh frontier               # Frontier-Eng, from a Frontier-Engineering checkout
 ```
 
+### Check setup and preview workload
+
+Two offline commands make no model call, need no credentials, and create no `runs/` directories:
+
+```bash
+python3 rrsi.py --domain <name> doctor [--json]   # prerequisites; exits 1 if any check fails
+python3 rrsi.py --domain <name> plan [--json]     # upper-bound trial and search-call counts
+```
+
+`doctor` checks Python, the `anthropic` package (found, not imported), that `RRSI_VERTEX_PROJECTS` is set (only the project count is shown), git, the configuration, the runs directory, the domain's files and task set, and the instance's own tools (Docker, the benchmark checkout, `bwrap`). `plan` prints baseline, candidate and smoke trial counts and search-role calls for the configured `T`, `k` and `m`, for example 178 baseline and up to 7,120 candidate trials for `coding`. They are upper bounds, not spend or latency, and exclude judge calls, retries and infrastructure reruns. Note that `round --dry-run` is not free: it still makes paid analyst calls.
+
 ## 📊 Results
 
 Numbers from the paper, with Claude Opus 4.8 as the frozen policy in every instance and every number measured against the unevolved harness H_0 in the same window. "Evolve" is the split the harness was searched on; the other rows never entered selection. Terminal-Bench, SWE-bench, JobBench, GDPval, APEX-Agents and EngDesign report pass rate, Harvey LAB the fraction of rubric criteria passed and Frontier-Eng Medal points.

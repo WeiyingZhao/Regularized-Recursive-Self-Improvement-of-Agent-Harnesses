@@ -36,6 +36,7 @@ texts that make the three search roles speak the benchmark's language.
     render_trace       what the analyst/digester/proposer read
     task_row           one-line summary per trace in the task tables
     smoke              liveness check before evaluation (not a selection rule)
+    doctor_checks      offline prerequisite checks for `doctor` (rrsi.doctor)
     critic_patterns    deterministic leakage denylist   rrsi.critic
     component_signals  diff regexes -> component tag    rrsi.components
     guards             non-compensatory domain checks   rrsi.selection (Sec. 3.3)
@@ -102,6 +103,11 @@ class Domain:
     component_signals: list = []
     briefs: dict = {}                    # analyst / digester / proposer / critic
     source_exts: set = {".py", ".txt", ".md", ".json"}
+
+    def doctor_checks(self) -> list:
+        """Cheap filesystem / PATH checks (rrsi.doctor.CheckResult) for this domain's
+        external prerequisites. No model call, no benchmark run."""
+        return []
 
     def harness_dir(self, root: Path) -> Path:
         return (root / "domains" / self.name / self.harness_path).resolve()

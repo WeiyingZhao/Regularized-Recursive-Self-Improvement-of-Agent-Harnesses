@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -48,6 +49,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent))
 sys.path.insert(0, str(HERE))
+from rrsi.doctor import CheckResult    # noqa: E402
 from rrsi.domain import Domain          # noqa: E402
 from rrsi.evaluate import TaskResult    # noqa: E402
 import briefs                            # noqa: E402
@@ -166,6 +168,19 @@ class CodingDomain(Domain):
 
     def smoke_ids(self, incumbent_per_task=None) -> list[str]:
         return list(CFG["smoke_tasks"])
+
+    def doctor_checks(self) -> list:
+        py = coding_runtime(os.environ)["python"]
+        docker = shutil.which("docker")
+        return [
+            CheckResult("coding python", "ok", py) if Path(py).is_file() or shutil.which(py)
+            else CheckResult("coding python", "fail", f"{py} not found",
+                             "python3 -m venv domains/coding/.venv && domains/coding/.venv/bin/pip "
+                             "install 'harbor>=0.18'   # or set RRSI_CODING_VENV / RRSI_CODING_PYTHON"),
+            CheckResult("docker", "ok", docker) if docker
+            else CheckResult("docker", "fail", "docker is not on PATH",
+                             "install Docker (harbor runs every trial in a container)"),
+        ]
 
     # ---- Evaluate ----------------------------------------------------------
     def _harbor(self, root: Path, runs_dir: Path, job: str, ids: list[str] | None,
